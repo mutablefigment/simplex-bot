@@ -55,6 +55,60 @@ Package boundaries:
 
 Interfaces (the seams that matter for testing) live in each adapter package; `bot` depends on those.
 
+## WS protocol shape
+
+Verified against `simplex-chat v6.4.10.0` started with `simplex-chat -p 5225`.
+
+**Envelope.** Every command and response uses a JSON envelope on text frames. Bare-text commands (no envelope) return `chatCmdError "invalid request"`.
+
+```
+TX (command):       {"corrId":"<id>", "cmd":"<cli-command-string>"}
+RX (response):      {"corrId":"<id>", "resp":{"type":"<type>", ...}}      // corrId echoed
+RX (push event):    {"resp":{"type":"<type>", ...}}                       // no corrId
+```
+
+`corrId` presence is the discriminator: with-corrId is the response to a request you sent, without is a spontaneous push event from the server.
+
+**Commands we use.** The `cmd` value is the same string the simplex-chat TUI accepts.
+
+| Command | Response `type` | Notes |
+|---|---|---|
+| `/contacts` | `contactsList` | `contacts[].contactId`, `contacts[].localDisplayName`. Use this on bootstrap to discover the admin contactId. |
+| `/_send @<cid> text <body>` | `newChatItems` | Plain (non-live) send. Returns one item in `chatItems[0].chatItem.meta.itemId`. |
+| `/_send @<cid> live=on text <body>` | `newChatItems` | Live message — `meta.itemLive: true`. |
+| `/_send @<cid> live=on json [{"msgContent":{"type":"text","text":"…"}, "quotedItemId":N}]` | `newChatItems` | JSON form; needed when quoting. `quotedItem.itemId` echoes back. |
+| `/_update item @<cid> <itemId> live=on text <body>` | `chatItemUpdated` | Mid-stream live update. Single item in `chatItem` (NOT `chatItems[]`). |
+| `/_update item @<cid> <itemId> text <body>` | `chatItemUpdated` | Finalise — drops `live=on`, sets `meta.itemLive: false`. |
+| `/_get chat @<cid> count=N` | `apiChat` | Per-contact history. Items at `chat.chatItems[]`. Used for orphan cleanup. |
+| any malformed | `chatCmdError` | `chatError.errorType.message` describes. |
+
+**Push events.** Inbound messages and out-of-band updates arrive without `corrId`:
+
+| `type` | Meaning | Action |
+|---|---|---|
+| `newChatItems` | Items added to a chat. Includes both peer-sent (`directRcv`) and our own sends (`directSnd`). | Filter on `chatItem.chatDir.type == "directRcv"` and `chatInfo.contact.contactId == allowed_contact_id`. |
+| `chatItemsStatusesUpdated` | Delivery status changes (sent → rcvd, etc.) for our outbound items. | Ignore. |
+| `chatItemUpdated` | Item edited (incl. our own live updates echoing back). | Ignore unless implementing read-receipt UI. |
+| `contactSubSummary`, `userContactSubSummary`, `terminalEvent` | Subscription state on connect. | Log at debug, ignore. |
+
+**Item shape (the part we extract).** For both `newChatItems[*]` and `chatItemUpdated`'s single `chatItem`:
+
+```jsonc
+{
+  "chatInfo":  { "contact": { "contactId": 4, "localDisplayName": "..." } },
+  "chatItem":  {
+    "chatDir":     { "type": "directRcv" | "directSnd" },
+    "content":     { "msgContent": { "type": "text", "text": "..." } },
+    "meta":        { "itemId": 14, "itemLive": false, "itemEdited": false },
+    "quotedItem":  { "itemId": 12, ... }    // present only when quoting
+  }
+}
+```
+
+`content.msgContent.type` may also be `image`, `file`, `voice`, etc. — branch on it; the bot currently treats only `text` as the prompt body and looks at sibling fields for attachments.
+
+**Identity gotcha.** `contactId == 1` typically belongs to the bot's own user (visible as `userContactId`/`userContactSubSummary`). The admin's contactId is whatever appears under `contactSubSummary.contactSubscriptions[].contact.contactId` (or the same field under `contactsList.contacts[]`). The example config's `allowed_contact_id = 1` is a placeholder, not a default — read the real value off `/contacts` during bootstrap step 5.
+
 ## Config (`/etc/claude-bot/config.toml`)
 
 ```toml
@@ -113,9 +167,9 @@ Plan B: resumed session per user. First message captures `session_id` from the `
 3. Otherwise enqueue. Single worker goroutine runs one turn at a time.
 4. Worker:
    - Ingest any attachments → `<workspace>/inbox/<ts>_<name>`, append `[attached: ./inbox/…]` to prompt.
-   - `/_send @1 live=on json [{msgContent:..., quotedItemId:<promptItemId>}]` → save returned itemId.
+   - `/_send @<cid> live=on json [{msgContent:..., quotedItemId:<promptItemId>}]` → save returned itemId.
    - Spawn `claude` with `--resume <stored session_id>` (or fresh if none), `--model`, `--permission-mode bypassPermissions`, `--allowedTools`, `--output-format stream-json --verbose`. `cmd.Dir = workspace`.
-   - Parse stream-json. On `init`: persist `session_id`. On `assistant` text: append to buffer (after markdown translation), flush every 3s via `/_update item @1 <itemId> live=on json {...}`. On `tool_use`: ignored (config). On size threshold: finalise current live message (non-live update), open a new live message (no quote), continue.
+   - Parse stream-json. On `init`: persist `session_id`. On `assistant` text: append to buffer (after markdown translation), flush every 3s via `/_update item @<cid> <itemId> live=on text <body>`. On `tool_use`: ignored (config). On size threshold: finalise current live message (non-live update), open a new live message (no quote), continue.
    - On `result`: finalise with full buffer + cost footer; insert `turns` row.
 5. Errors funnel into typed cases (`auth`, `rate_limit`, `timeout`, `crash`); each finalises the live message with a tagged suffix.
 
@@ -214,7 +268,7 @@ Coverage target: parser + chunker + dispatcher + FSM + translator. Skip exhausti
 1. Build & install binary. Install systemd unit (or import nix module locally).
 2. Create `claude-bot` user; provision `/var/lib/claude-bot`.
 3. As `claude-bot`: `claude /login` (or drop `ANTHROPIC_API_KEY` in EnvironmentFile).
-4. As `claude-bot`: `simplex-chat` interactive — set name, `/ad` for address, share link to phone, accept request, note contactId, quit.
+4. As `claude-bot`: `simplex-chat` interactive — set name, `/ad` for address, share link to phone, accept request. Then `/contacts` and copy the admin's `contactId` (NOT the `userContactId` shown for the bot itself; see "Identity gotcha" in WS protocol shape). Quit.
 5. Write `config.toml` with that contactId.
 6. `systemctl enable --now simplex-chat claude-bot`.
 

@@ -13,6 +13,7 @@ type Client interface {
 	// after the connection has been torn down.
 	Run(ctx context.Context) (<-chan Event, error)
 
+	Send(ctx context.Context, contactID int64, text string, quotedItemID int64) (itemID int64, err error)
 	SendLive(ctx context.Context, contactID int64, text string, quotedItemID int64) (itemID int64, err error)
 	UpdateLive(ctx context.Context, contactID, itemID int64, text string) error
 	Finalise(ctx context.Context, contactID, itemID int64, text string) error
