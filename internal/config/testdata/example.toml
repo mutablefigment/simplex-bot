@@ -1,0 +1,27 @@
+[simplex]
+ws_url = "ws://127.0.0.1:5225"
+allowed_contact_id = 1
+
+[claude]
+binary = "/usr/local/bin/claude"
+workspace = "/var/lib/claude-bot/workspace"
+model = "claude-opus-4-7"
+allowed_tools = ["Read", "Grep", "Glob", "Edit", "Write", "Bash", "WebFetch"]
+disallowed_tools = []
+show_tool_use = false
+show_cost_footer = true
+turn_timeout = "30m"
+
+[storage]
+db_path = "/var/lib/claude-bot/state.db"
+inbox_dir = "/var/lib/claude-bot/workspace/inbox"
+inbox_retention = "720h"
+
+[live_message]
+update_interval = "3s"
+chunk_threshold = 4096
+
+[log]
+level = "info"
+format = "json"
+log_full_messages = false

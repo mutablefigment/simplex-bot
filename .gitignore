@@ -1,0 +1,7 @@
+/claude-bot
+/result
+/result-*
+*.db
+*.db-journal
+.direnv/
+/workspace/
