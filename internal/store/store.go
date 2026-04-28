@@ -35,5 +35,10 @@ type Store interface {
 	UpdateTurn(ctx context.Context, t Turn) error
 	TotalCost(ctx context.Context) (float64, error)
 
+	// MarkStaleRunningTurns flips any turns left as 'running' (because the
+	// process crashed mid-turn) to 'cancelled' with ended_at = now. Called
+	// once at startup as part of orphan cleanup.
+	MarkStaleRunningTurns(ctx context.Context) error
+
 	Close() error
 }

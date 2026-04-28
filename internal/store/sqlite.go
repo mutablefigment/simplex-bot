@@ -23,6 +23,18 @@ func Open(ctx context.Context, dbPath string) (Store, error) {
 		_ = db.Close()
 		return nil, fmt.Errorf("ping sqlite: %w", err)
 	}
+	// busy_timeout: avoid SQLITE_BUSY when the worker writes (live_messages,
+	// turns, bot_state) and a slash command reads concurrently.
+	// WAL: readers don't block writers and vice versa.
+	for _, pragma := range []string{
+		"PRAGMA busy_timeout = 5000",
+		"PRAGMA journal_mode = WAL",
+	} {
+		if _, err := db.ExecContext(ctx, pragma); err != nil {
+			_ = db.Close()
+			return nil, fmt.Errorf("apply %s: %w", pragma, err)
+		}
+	}
 	if err := applyMigrations(ctx, db); err != nil {
 		_ = db.Close()
 		return nil, err
@@ -131,6 +143,13 @@ func (s *sqliteStore) UpdateTurn(ctx context.Context, t Turn) error {
 		nullableString(t.Error),
 		t.ID,
 	)
+	return err
+}
+
+func (s *sqliteStore) MarkStaleRunningTurns(ctx context.Context) error {
+	_, err := s.db.ExecContext(ctx,
+		`UPDATE turns SET status = 'cancelled', ended_at = ? WHERE status = 'running'`,
+		time.Now().UTC().Format(time.RFC3339Nano))
 	return err
 }
 
