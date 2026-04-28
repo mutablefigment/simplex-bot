@@ -23,6 +23,17 @@ type streamFrame struct {
 		} `json:"content"`
 	} `json:"message"`
 
+	// Event is set on `stream_event` frames emitted with
+	// --include-partial-messages: content_block_delta carries text_delta chunks
+	// as the model produces them.
+	Event struct {
+		Type  string `json:"type"`
+		Delta struct {
+			Type string `json:"type"`
+			Text string `json:"text"`
+		} `json:"delta"`
+	} `json:"event"`
+
 	IsError      bool    `json:"is_error"`
 	Result       string  `json:"result"`
 	TotalCostUSD float64 `json:"total_cost_usd"`
@@ -40,7 +51,10 @@ func parseStream(ctx context.Context, r io.Reader, out chan<- Event) (*ResultEve
 	scanner := bufio.NewScanner(r)
 	scanner.Buffer(make([]byte, 64*1024), 1<<22)
 
-	var organic *ResultEvent
+	var (
+		organic  *ResultEvent
+		sawDelta bool // once a text_delta arrives, the cumulative `assistant` frame would double-count
+	)
 	for scanner.Scan() {
 		if ctx.Err() != nil {
 			return organic, ctx.Err()
@@ -65,11 +79,24 @@ func parseStream(ctx context.Context, r io.Reader, out chan<- Event) (*ResultEve
 					return organic, ctx.Err()
 				}
 			}
+		case "stream_event":
+			// content_block_delta with text_delta = incremental assistant text.
+			// Other stream_event types (message_start, content_block_start,
+			// thinking_delta, signature_delta, message_stop, ...) are ignored.
+			if f.Event.Type == "content_block_delta" && f.Event.Delta.Type == "text_delta" && f.Event.Delta.Text != "" {
+				sawDelta = true
+				select {
+				case out <- AssistantTextEvent{Text: f.Event.Delta.Text}:
+				case <-ctx.Done():
+					return organic, ctx.Err()
+				}
+			}
 		case "assistant":
 			for _, c := range f.Message.Content {
 				switch c.Type {
 				case "text":
-					if c.Text == "" {
+					// Skip cumulative text frames once we've started delta mode.
+					if sawDelta || c.Text == "" {
 						continue
 					}
 					select {

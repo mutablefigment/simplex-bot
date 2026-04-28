@@ -44,6 +44,7 @@ func (r *execRunner) Run(ctx context.Context, prompt, sessionID string) (<-chan 
 		"-p",
 		"--output-format", "stream-json",
 		"--verbose",
+		"--include-partial-messages",
 		"--permission-mode", "bypassPermissions",
 		"--model", r.cfg.Model,
 	}

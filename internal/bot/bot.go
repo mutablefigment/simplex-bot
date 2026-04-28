@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"strings"
+	"sync"
 	"time"
 
 	"claude-bot/internal/claude"
@@ -24,13 +25,14 @@ type Bot struct {
 	store   store.Store
 
 	queue chan job
+
+	mu           sync.Mutex
+	activeCancel context.CancelFunc // set while a turn is running; /stop calls it
 }
 
 // job is a unit of work for the worker. Exactly one of prompt or slash is set.
-// All work — including slash commands — is routed through the queue so that
-// the worker is the single writer of session state. This eliminates the
-// read-modify-write race between an in-flight turn (which writes session_id
-// at start) and a concurrent /new (which would clear it).
+// /stop is NOT routed through here — it short-circuits in handleChatItem and
+// cancels the active turn directly via activeCancel.
 type job struct {
 	prompt     string
 	slash      *Cmd
@@ -63,28 +65,65 @@ func (b *Bot) Run(ctx context.Context) error {
 	}
 
 	workerDone := make(chan struct{})
-	go func() {
-		defer close(workerDone)
-		b.runWorker(ctx)
-	}()
+	workerStarted := false
 
 	for ev := range events {
-		b.handleEvent(ctx, ev)
+		switch e := ev.(type) {
+		case simplex.ConnectedEvent:
+			b.log.Info("simplex: connected")
+			if !workerStarted {
+				if err := b.runStartupCleanup(ctx); err != nil {
+					b.log.Warn("startup cleanup", "err", err)
+				}
+				go func() {
+					defer close(workerDone)
+					b.runWorker(ctx)
+				}()
+				workerStarted = true
+			}
+		case simplex.DisconnectedEvent:
+			b.log.Warn("simplex: disconnected", "err", e.Err)
+		case simplex.ChatItemsEvent:
+			b.handleChatItem(ctx, e)
+		}
 	}
-	close(b.queue)
-	<-workerDone
+	if workerStarted {
+		close(b.queue)
+		<-workerDone
+	}
 	return ctx.Err()
 }
 
-func (b *Bot) handleEvent(ctx context.Context, ev simplex.Event) {
-	switch e := ev.(type) {
-	case simplex.ConnectedEvent:
-		b.log.Info("simplex: connected")
-	case simplex.DisconnectedEvent:
-		b.log.Warn("simplex: disconnected", "err", e.Err)
-	case simplex.ChatItemsEvent:
-		b.handleChatItem(ctx, e)
+// runStartupCleanup finalises any live messages left dangling by a previous
+// process and marks any 'running' turns as cancelled. Called once after the
+// first ConnectedEvent and before the worker starts pulling jobs, so a fresh
+// inbound prompt can't interleave with the cleanup.
+//
+// Wire-side Finalise failures are non-fatal — we mark the DB row finalised
+// anyway to avoid an unbounded loop on phantom items (e.g. the user deleted
+// the chat). Original partial text is discarded; surfacing it would require
+// implementing simplex.GetChats, which is deferred.
+func (b *Bot) runStartupCleanup(ctx context.Context) error {
+	orphans, err := b.store.UnfinalisedLiveMessages(ctx)
+	if err != nil {
+		return fmt.Errorf("query orphans: %w", err)
 	}
+	for _, o := range orphans {
+		if err := b.simplex.Finalise(ctx, o.ContactID, o.ItemID, "⚠️ bot restarted"); err != nil {
+			b.log.Warn("orphan finalise: wire call failed; marking row finalised anyway",
+				"item_id", o.ItemID, "err", err)
+		}
+		if err := b.store.FinaliseLiveMessage(ctx, o.ItemID); err != nil {
+			b.log.Error("orphan finalise: db update failed", "item_id", o.ItemID, "err", err)
+		}
+	}
+	if len(orphans) > 0 {
+		b.log.Info("startup: finalised orphan live messages", "count", len(orphans))
+	}
+	if err := b.store.MarkStaleRunningTurns(ctx); err != nil {
+		return fmt.Errorf("mark stale turns: %w", err)
+	}
+	return nil
 }
 
 func (b *Bot) handleChatItem(ctx context.Context, ev simplex.ChatItemsEvent) {
@@ -96,6 +135,13 @@ func (b *Bot) handleChatItem(ctx context.Context, ev simplex.ChatItemsEvent) {
 
 	text := strings.TrimSpace(ev.Text)
 	if text == "" {
+		return
+	}
+
+	// /stop is handled out-of-queue: by the time it would dequeue, the turn
+	// it's trying to cancel would already be over.
+	if cmd, ok := parseCommand(text); ok && cmd.Name == "stop" {
+		b.handleStop(ctx, ev)
 		return
 	}
 
@@ -119,6 +165,18 @@ func (b *Bot) handleChatItem(ctx context.Context, ev simplex.ChatItemsEvent) {
 	}
 }
 
+func (b *Bot) handleStop(ctx context.Context, ev simplex.ChatItemsEvent) {
+	b.mu.Lock()
+	cancel := b.activeCancel
+	b.mu.Unlock()
+	if cancel == nil {
+		_, _ = b.simplex.Send(ctx, ev.ContactID, "nothing to stop", ev.ItemID)
+		return
+	}
+	cancel()
+	b.log.Info("/stop: turn cancelled")
+}
+
 func (b *Bot) runSlash(ctx context.Context, j job) {
 	switch j.slash.Name {
 	case "new":
@@ -138,6 +196,7 @@ func (b *Bot) runSlash(ctx context.Context, j job) {
 
 const helpText = `commands:
 /new — start a fresh Claude session
+/stop — cancel the current turn (if any)
 /help — show this message
 anything else is sent to Claude as a prompt`
 
@@ -161,7 +220,15 @@ func (b *Bot) runWorker(ctx context.Context) {
 
 func (b *Bot) runTurn(parent context.Context, j job) {
 	turnCtx, cancel := context.WithTimeout(parent, time.Duration(b.cfg.Claude.TurnTimeout))
-	defer cancel()
+	b.mu.Lock()
+	b.activeCancel = cancel
+	b.mu.Unlock()
+	defer func() {
+		b.mu.Lock()
+		b.activeCancel = nil
+		b.mu.Unlock()
+		cancel()
+	}()
 
 	sessionID, err := b.store.GetSessionID(turnCtx)
 	if err != nil {
@@ -193,57 +260,98 @@ func (b *Bot) runTurn(parent context.Context, j job) {
 		return
 	}
 
+	lt := newLiveTurn(b.log, b.simplex, b.store, j.contactID, j.itemID, b.cfg.LiveMessage.ChunkThreshold)
+
+	interval := time.Duration(b.cfg.LiveMessage.UpdateInterval)
+	if interval <= 0 {
+		interval = 3 * time.Second
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
 	var (
-		buf            strings.Builder
-		newSessionID   string
-		terminal       claude.ResultEvent
-		gotTerminal    bool
+		terminal    claude.ResultEvent
+		gotTerminal bool
 	)
-	for ev := range events {
-		switch e := ev.(type) {
-		case claude.InitEvent:
-			newSessionID = e.SessionID
-			if newSessionID != "" && newSessionID != sessionID {
-				if err := b.store.SetSessionID(turnCtx, newSessionID); err != nil {
-					b.log.Error("persist session id", "err", err)
-				}
+loop:
+	for {
+		select {
+		case <-turnCtx.Done():
+			break loop
+		case <-ticker.C:
+			if err := lt.Flush(turnCtx); err != nil {
+				b.log.Warn("live flush", "err", err)
 			}
-		case claude.AssistantTextEvent:
-			buf.WriteString(e.Text)
-		case claude.ToolUseEvent:
-			// suppressed in slice; b.cfg.Claude.ShowToolUse honored in next milestone.
-		case claude.ResultEvent:
-			terminal = e
-			gotTerminal = true
+		case ev, ok := <-events:
+			if !ok {
+				break loop
+			}
+			switch e := ev.(type) {
+			case claude.InitEvent:
+				if e.SessionID != "" && e.SessionID != sessionID {
+					if err := b.store.SetSessionID(turnCtx, e.SessionID); err != nil {
+						b.log.Error("persist session id", "err", err)
+					}
+				}
+			case claude.AssistantTextEvent:
+				lt.Append(e.Text)
+			case claude.ToolUseEvent:
+				// suppressed in this slice; ShowToolUse honored later.
+			case claude.ResultEvent:
+				terminal = e
+				gotTerminal = true
+			}
 		}
 	}
 
-	if !gotTerminal {
-		// Defensive — runner contract guarantees a terminal ResultEvent. If it
-		// breaks, surface as a crash rather than dropping the turn.
-		terminal = claude.ResultEvent{Error: fmt.Errorf("%w: runner closed channel without ResultEvent", claude.ErrCrash)}
+	// Final pre-Finalise flush uses parent ctx (not turnCtx): claude may have
+	// buffered the full response into a single trailing event, in which case
+	// the loop exits with non-empty buf and we need to lazy-open + insert the
+	// live_messages row even after /stop or timeout cancelled turnCtx.
+	if err := lt.Flush(parent); err != nil {
+		b.log.Debug("live flush final", "err", err)
 	}
 
-	body := buf.String()
-	status := "ok"
-	switch {
-	case terminal.Error != nil:
-		body = appendErrorTag(body, terminal.Error)
-		status = errorStatus(terminal.Error)
-	case b.cfg.Claude.ShowCostFooter:
-		body = appendCostFooter(body, terminal.CostUSD, terminal.DurationMS)
+	suffix, status, runErr := b.classifyTurn(turnCtx, gotTerminal, terminal)
+
+	sent, err := lt.Finalise(parent, suffix)
+	if err != nil {
+		b.log.Error("live finalise", "err", err)
+	}
+	if !sent {
+		body := lt.FinaliseText()
+		if strings.TrimSpace(body) == "" {
+			body = "(empty response)"
+		}
+		if _, err := b.simplex.Send(parent, j.contactID, body, j.itemID); err != nil {
+			b.log.Error("send fallback reply", "err", err)
+		}
 	}
 
-	if strings.TrimSpace(body) == "" {
-		body = "(empty response)"
-	}
-
-	if _, err := b.simplex.Send(parent, j.contactID, body, j.itemID); err != nil {
-		b.log.Error("send reply", "err", err)
-	}
-
-	b.finishTurn(parent, turnID, turnRow, status, terminal.CostUSD, terminal.Error)
+	b.finishTurn(parent, turnID, turnRow, status, terminal.CostUSD, runErr)
 	b.log.Info("turn end", "status", status, "cost_usd", terminal.CostUSD, "duration_ms", terminal.DurationMS)
+}
+
+// classifyTurn decides the suffix to attach to the final message, the status
+// to record on the turn row, and the runErr to log/return. Cancellation by
+// /stop or the turn timeout is detected via turnCtx.Err().
+func (b *Bot) classifyTurn(turnCtx context.Context, gotTerminal bool, terminal claude.ResultEvent) (suffix, status string, runErr error) {
+	switch {
+	case errors.Is(turnCtx.Err(), context.DeadlineExceeded):
+		return "⏱️ timeout", "timeout", claude.ErrTimeout
+	case errors.Is(turnCtx.Err(), context.Canceled):
+		return "⚠️ interrupted", "cancelled", context.Canceled
+	case !gotTerminal:
+		err := fmt.Errorf("%w: runner closed channel without ResultEvent", claude.ErrCrash)
+		return "⚠️ error: " + err.Error(), "error", err
+	case terminal.Error != nil:
+		return errorSuffix(terminal.Error), errorStatus(terminal.Error), terminal.Error
+	default:
+		if b.cfg.Claude.ShowCostFooter && (terminal.CostUSD > 0 || terminal.DurationMS > 0) {
+			return costSuffix(terminal.CostUSD, terminal.DurationMS), "ok", nil
+		}
+		return "", "ok", nil
+	}
 }
 
 func (b *Bot) finishTurn(ctx context.Context, turnID int64, base store.Turn, status string, cost float64, runErr error) {
@@ -257,20 +365,14 @@ func (b *Bot) finishTurn(ctx context.Context, turnID int64, base store.Turn, sta
 	if runErr != nil {
 		base.Error = runErr.Error()
 	}
-	if err := b.store.UpdateTurn(ctx, base); err != nil {
+	// Detach: turn-row bookkeeping shouldn't be lost just because /stop or the
+	// turn timeout cancelled the parent ctx.
+	if err := b.store.UpdateTurn(detached(ctx), base); err != nil {
 		b.log.Error("update turn row", "err", err)
 	}
 }
 
-func appendErrorTag(body string, err error) string {
-	tag := errorTag(err)
-	if body == "" {
-		return tag
-	}
-	return body + "\n\n" + tag
-}
-
-func errorTag(err error) string {
+func errorSuffix(err error) string {
 	switch {
 	case errors.Is(err, claude.ErrTimeout):
 		return "⏱️ timeout"
@@ -296,15 +398,8 @@ func errorStatus(err error) string {
 	}
 }
 
-func appendCostFooter(body string, cost float64, durationMS int64) string {
-	if cost == 0 && durationMS == 0 {
-		return body
-	}
-	footer := fmt.Sprintf("— $%.4f · %.1fs", cost, float64(durationMS)/1000)
-	if body == "" {
-		return footer
-	}
-	return body + "\n\n" + footer
+func costSuffix(cost float64, durationMS int64) string {
+	return fmt.Sprintf("— $%.4f · %.1fs", cost, float64(durationMS)/1000)
 }
 
 func preview(s string, full bool) string {
