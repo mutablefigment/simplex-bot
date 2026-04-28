@@ -26,9 +26,16 @@ type Bot struct {
 	queue chan job
 }
 
+// job is a unit of work for the worker. Exactly one of prompt or slash is set.
+// All work — including slash commands — is routed through the queue so that
+// the worker is the single writer of session state. This eliminates the
+// read-modify-write race between an in-flight turn (which writes session_id
+// at start) and a concurrent /new (which would clear it).
 type job struct {
-	prompt   string
-	itemID   int64 // user's message itemID for quoting (unused in this slice)
+	prompt     string
+	slash      *Cmd
+	itemID     int64
+	contactID  int64
 	receivedAt time.Time
 }
 
@@ -92,33 +99,40 @@ func (b *Bot) handleChatItem(ctx context.Context, ev simplex.ChatItemsEvent) {
 		return
 	}
 
+	j := job{itemID: ev.ItemID, contactID: ev.ContactID, receivedAt: time.Now()}
 	if cmd, ok := parseCommand(text); ok {
-		b.handleSlash(ctx, ev, cmd)
-		return
+		j.slash = &cmd
+	} else {
+		j.prompt = text
 	}
 
 	select {
-	case b.queue <- job{prompt: text, itemID: ev.ItemID, receivedAt: time.Now()}:
-		b.log.Info("queued turn", "prompt_preview", preview(text, b.cfg.Log.LogFullMessages))
+	case b.queue <- j:
+		if j.slash != nil {
+			b.log.Info("queued slash", "name", j.slash.Name)
+		} else {
+			b.log.Info("queued turn", "prompt_preview", preview(text, b.cfg.Log.LogFullMessages))
+		}
 	default:
-		b.log.Warn("queue full; dropping turn")
+		b.log.Warn("queue full; dropping message")
 		_, _ = b.simplex.Send(ctx, ev.ContactID, "⚠️ busy — message dropped (queue full)", ev.ItemID)
 	}
 }
 
-func (b *Bot) handleSlash(ctx context.Context, ev simplex.ChatItemsEvent, cmd Cmd) {
-	switch cmd.Name {
+func (b *Bot) runSlash(ctx context.Context, j job) {
+	switch j.slash.Name {
 	case "new":
 		if err := b.store.ClearSession(ctx); err != nil {
 			b.log.Error("clear session", "err", err)
-			_, _ = b.simplex.Send(ctx, ev.ContactID, "⚠️ failed to clear session: "+err.Error(), ev.ItemID)
+			_, _ = b.simplex.Send(ctx, j.contactID, "⚠️ failed to clear session: "+err.Error(), j.itemID)
 			return
 		}
-		_, _ = b.simplex.Send(ctx, ev.ContactID, "session cleared", ev.ItemID)
+		b.log.Info("session cleared")
+		_, _ = b.simplex.Send(ctx, j.contactID, "session cleared", j.itemID)
 	case "help":
-		_, _ = b.simplex.Send(ctx, ev.ContactID, helpText, ev.ItemID)
+		_, _ = b.simplex.Send(ctx, j.contactID, helpText, j.itemID)
 	default:
-		_, _ = b.simplex.Send(ctx, ev.ContactID, "unknown command: /"+cmd.Name, ev.ItemID)
+		_, _ = b.simplex.Send(ctx, j.contactID, "unknown command: /"+j.slash.Name, j.itemID)
 	}
 }
 
@@ -135,6 +149,10 @@ func (b *Bot) runWorker(ctx context.Context) {
 		case j, ok := <-b.queue:
 			if !ok {
 				return
+			}
+			if j.slash != nil {
+				b.runSlash(ctx, j)
+				continue
 			}
 			b.runTurn(ctx, j)
 		}
@@ -169,7 +187,7 @@ func (b *Bot) runTurn(parent context.Context, j job) {
 	events, err := b.claude.Run(turnCtx, j.prompt, sessionID)
 	if err != nil {
 		b.log.Error("claude run", "err", err)
-		_, _ = b.simplex.Send(parent, b.cfg.Simplex.AllowedContactID,
+		_, _ = b.simplex.Send(parent, j.contactID,
 			fmt.Sprintf("⚠️ failed to start claude: %v", err), j.itemID)
 		b.finishTurn(parent, turnID, turnRow, "error", 0, err)
 		return
@@ -220,7 +238,7 @@ func (b *Bot) runTurn(parent context.Context, j job) {
 		body = "(empty response)"
 	}
 
-	if _, err := b.simplex.Send(parent, b.cfg.Simplex.AllowedContactID, body, j.itemID); err != nil {
+	if _, err := b.simplex.Send(parent, j.contactID, body, j.itemID); err != nil {
 		b.log.Error("send reply", "err", err)
 	}
 
