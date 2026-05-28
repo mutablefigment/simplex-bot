@@ -64,6 +64,8 @@ func (b *Bot) Run(ctx context.Context) error {
 		return fmt.Errorf("simplex run: %w", err)
 	}
 
+	go b.runInboxSweeper(ctx)
+
 	workerDone := make(chan struct{})
 	workerStarted := false
 
