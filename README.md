@@ -1,6 +1,8 @@
 # claude-bot
 
-Single-user SimpleX <-> Claude Code bridge. Architecture lives in `DESIGN.md`.
+Single-user SimpleX <-> Claude Code bridge. Architecture lives in `DESIGN.md`;
+the trust model and deployment posture live in `SECURITY.md` — **read that
+before running the bot on any host you share with other users**.
 
 ## Build
 
