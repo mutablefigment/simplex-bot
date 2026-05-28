@@ -35,6 +35,12 @@ type Store interface {
 	UpdateTurn(ctx context.Context, t Turn) error
 	TotalCost(ctx context.Context) (float64, error)
 
+	// LatestTurn returns the most recent turn by id. Found is false when no
+	// turns have been recorded yet.
+	LatestTurn(ctx context.Context) (t Turn, found bool, err error)
+	// TurnCount returns the total number of recorded turns.
+	TurnCount(ctx context.Context) (int, error)
+
 	// MarkStaleRunningTurns flips any turns left as 'running' (because the
 	// process crashed mid-turn) to 'cancelled' with ended_at = now. Called
 	// once at startup as part of orphan cleanup.

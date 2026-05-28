@@ -41,7 +41,7 @@ func main() {
 
 	sx := simplex.New(cfg.Simplex, log)
 	cr := claude.NewRunner(cfg.Claude, log)
-	b := bot.New(cfg, log, sx, cr, st)
+	b := bot.New(cfg, log, version, sx, cr, st)
 
 	if err := b.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
 		log.Error("bot exited", "err", err)
