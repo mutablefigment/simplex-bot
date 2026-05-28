@@ -356,14 +356,6 @@ func (c *wsClient) expectUpdate(ctx context.Context, cmd string) error {
 	return nil
 }
 
-// GetChats is used at startup to find live messages we own and finalise them.
-// TODO(milestone-2): the exact command form for "all chats with their live items"
-// hasn't been verified against simplex-chat. Implement once probed.
-func (c *wsClient) GetChats(ctx context.Context) ([]Chat, error) {
-	c.log.Debug("simplex.GetChats: not yet implemented")
-	return nil, nil
-}
-
 func (c *wsClient) Close() error {
 	if !c.closed.CompareAndSwap(false, true) {
 		return nil

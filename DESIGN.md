@@ -213,7 +213,7 @@ func parseCommand(text string) (Cmd, bool) {
 
 - WS reconnect with capped backoff (1s→30s); buffered events redelivered by simplex-chat.
 - SIGTERM: cancel current turn ctx → claude SIGTERM → finalise current live message with `⚠️ interrupted` → exit (≤1s grace).
-- Startup: query `/_get chats` for items where `itemLive=true` we authored, finalise each with `⚠️ bot restarted`.
+- Startup: read the local `live_messages` sqlite mirror for rows with `finalised=0`, finalise each on the wire with `⚠️ bot restarted`. The mirror is the source of truth for items we authored — no wire-side `/_get chat` probe.
 - Turn timeout (30m): SIGTERM claude, finalise with `⏱️ timeout`, record `status='timeout'`. Session ID survives — next turn resumes.
 - Cancelled turns recorded in `turns` with whatever cost was reported up to cancellation.
 
