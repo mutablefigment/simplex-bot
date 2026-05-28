@@ -83,7 +83,10 @@ func (r *execRunner) Run(ctx context.Context, prompt, sessionID string) (<-chan 
 	if err := cmd.Start(); err != nil {
 		return nil, fmt.Errorf("start claude: %w", err)
 	}
-	r.log.Info("claude: spawned", "pid", cmd.Process.Pid, "session", sessionID, "prompt_bytes", len(prompt))
+	r.log.Info("claude: spawned",
+		"pid", cmd.Process.Pid,
+		"session", shortSession(sessionID),
+		"prompt_bytes", len(prompt))
 
 	out := make(chan Event, eventBuffer)
 	go r.supervise(ctx, cmd, stdout, stderrTail, out)
@@ -189,6 +192,16 @@ func firstLine(s string) string {
 		return s[:i]
 	}
 	return s
+}
+
+// shortSession returns the first 8 chars of a session id, matching the
+// logging convention in DESIGN.md ("session id (first 8)"). Returns the
+// original string when shorter than 8 chars (e.g. "" for fresh sessions).
+func shortSession(id string) string {
+	if len(id) <= 8 {
+		return id
+	}
+	return id[:8]
 }
 
 // tailBuffer keeps only the last `max` bytes written to it.
