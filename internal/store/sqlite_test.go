@@ -2,7 +2,9 @@ package store
 
 import (
 	"context"
+	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 	"time"
 )
@@ -45,6 +47,41 @@ func TestOpenAppliesMigrations(t *testing.T) {
 	}
 	if got2 != "abc-123" {
 		t.Errorf("session id after reopen = %q", got2)
+	}
+}
+
+// Issue #6: sqlite was opened with the process umask (typically 0o644).
+// Open() must restrict the DB file (and its WAL/SHM companions) to 0o600.
+func TestOpenRestrictsFilePerms(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("unix-style perms only")
+	}
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "perms.db")
+
+	st, err := Open(ctx, path)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+
+	// Force at least one write so WAL companions exist.
+	if err := st.SetSessionID(ctx, "perm-check"); err != nil {
+		t.Fatalf("SetSessionID: %v", err)
+	}
+
+	for _, suffix := range []string{"", "-wal", "-shm"} {
+		p := path + suffix
+		info, err := os.Stat(p)
+		if err != nil {
+			if suffix == "" {
+				t.Fatalf("stat main db: %v", err)
+			}
+			continue // -wal/-shm may not exist yet
+		}
+		if mode := info.Mode().Perm(); mode != 0o600 {
+			t.Errorf("%s mode = %#o, want 0o600", p, mode)
+		}
 	}
 }
 

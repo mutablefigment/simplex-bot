@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"os"
 	"time"
 
 	_ "modernc.org/sqlite"
@@ -38,6 +39,20 @@ func Open(ctx context.Context, dbPath string) (Store, error) {
 	if err := applyMigrations(ctx, db); err != nil {
 		_ = db.Close()
 		return nil, err
+	}
+	// Restrict to the service user. sqlite creates the DB file with the
+	// process umask (typically 0o644); WAL mode also creates -wal/-shm
+	// companions on first write, which the PRAGMAs above have already
+	// triggered. State here can include session ids and turn metadata.
+	for _, suffix := range []string{"", "-wal", "-shm"} {
+		p := dbPath + suffix
+		if _, err := os.Stat(p); err != nil {
+			continue // -wal/-shm may not exist if WAL hasn't been written yet
+		}
+		if err := os.Chmod(p, 0o600); err != nil {
+			_ = db.Close()
+			return nil, fmt.Errorf("chmod %s: %w", p, err)
+		}
 	}
 	return &sqliteStore{db: db}, nil
 }
