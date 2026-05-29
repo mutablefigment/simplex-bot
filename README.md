@@ -24,8 +24,9 @@ A config example is at `internal/config/testdata/example.toml`.
 nix build .#default
 ```
 
-The first build will fail with a `vendorHash` mismatch. Copy the reported
-hash into `nix/package.nix` (replacing `lib.fakeHash`) and re-run.
+Dependencies are vendored in-tree (`vendor/`), so the build is reproducible
+with no manual hash step. After changing `go.mod`/`go.sum`, regenerate the
+vendor directory with `go mod vendor` and commit it.
 
 ## Status
 
