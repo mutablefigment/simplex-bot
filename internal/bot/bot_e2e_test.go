@@ -258,11 +258,11 @@ func truncate(s string, n int) string {
 // fakeSimplex is an in-memory simplex.Client. inject() pushes events to the
 // bot; sends are recorded for assertion.
 type fakeSimplex struct {
-	mu      sync.Mutex
-	events  chan simplex.Event
-	sends   []sentMsg
-	sendCh  chan sentMsg
-	closed  bool
+	mu     sync.Mutex
+	events chan simplex.Event
+	sends  []sentMsg
+	sendCh chan sentMsg
+	closed bool
 }
 
 type sentMsg struct {
@@ -324,7 +324,11 @@ func (f *fakeSimplex) Finalise(ctx context.Context, cid, iid int64, text string)
 	return err
 }
 func (f *fakeSimplex) GetChats(ctx context.Context) ([]simplex.Chat, error) { return nil, nil }
-func (f *fakeSimplex) Close() error                                          { return nil }
+func (f *fakeSimplex) ReceiveFile(ctx context.Context, fileID int64, destPath string) (string, error) {
+	_, err := f.record(sentMsg{text: destPath, op: "receive_file"})
+	return destPath, err
+}
+func (f *fakeSimplex) Close() error { return nil }
 
 func (f *fakeSimplex) sendCount() int {
 	f.mu.Lock()

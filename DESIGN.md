@@ -238,7 +238,8 @@ Bot's first live message of each turn quotes the user's prompt via `quotedItemId
 
 ## Media
 
-- **Inbound:** files copied to `<workspace>/inbox/<ts>_<name>`; prompt suffixed with relative path. Claude reads via its own tool. Background goroutine deletes inbox files older than `inbox_retention`.
+- **Inbound:** a received chat item carries attachment metadata in a sibling `file` block (`CIFile`: `fileId`/`fileName`/`fileSize`/`fileStatus`). For each offered file (status `rcvInvitation`) the bot issues `/freceive <fileId> <workspace>/inbox/<ts>_<safe-name>`, blocks until the matching `rcvFileComplete` push confirms the bytes are on disk, then suffixes the prompt with `[attached: ./inbox/<ts>_<name>]` (one line per file). Filenames are sanitised to a single component — no separators, parent refs, leading dots, or whitespace (the `/freceive` grammar is space-delimited). A file with no caption is still a valid prompt. Claude reads the file via its own tool. Background goroutine deletes inbox files older than `inbox_retention`.
+  - Receiving runs on the WS event-loop goroutine and blocks (per-file timeout) until the transfer completes; acceptable for a single-user loopback bot. Wire shapes follow the simplex-chat TypeScript client types but are **unverified against a live instance** — in particular whether `/freceive` honours an absolute destination path (vs. a path relative to simplex-chat's files folder). Smoke-test before relying on it.
 - **Outbound:** text-only. Claude writes files in workspace; user reads via subsequent prompt.
 
 ## Whitelisting

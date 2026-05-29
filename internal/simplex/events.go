@@ -18,9 +18,12 @@ func (ChatItemsEvent) isSimplexEvent()    {}
 func (ConnectedEvent) isSimplexEvent()    {}
 func (DisconnectedEvent) isSimplexEvent() {}
 
+// File is an inbound attachment offered on a received chat item. Path is left
+// empty here — the bot chooses the destination and calls ReceiveFile to pull
+// the bytes down to it.
 type File struct {
+	ID   int64
 	Name string
-	Path string
 	Size int64
 }
 
