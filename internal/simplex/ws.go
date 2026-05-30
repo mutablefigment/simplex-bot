@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"os"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -33,6 +34,11 @@ type wsClient struct {
 	conn        *websocket.Conn
 	pending     map[string]chan responseFrame
 	fileWaiters map[int64]chan error // fileId -> completion signal for ReceiveFile
+	// abandoned tracks destPaths for transfers ReceiveFile gave up on (timeout/
+	// cancel) but which simplex-chat may still finish writing. A late, otherwise
+	// unrouted rcvFileComplete/rcvFileError for such a fileId triggers cleanup of
+	// the orphaned file. See issue #34.
+	abandoned map[int64]string
 
 	corrCtr atomic.Int64
 	closed  atomic.Bool
@@ -97,6 +103,7 @@ type ciFileBlock struct {
 func (c *wsClient) Run(ctx context.Context) (<-chan Event, error) {
 	c.pending = make(map[string]chan responseFrame)
 	c.fileWaiters = make(map[int64]chan error)
+	c.abandoned = make(map[int64]string)
 	c.done = make(chan struct{})
 	out := make(chan Event, eventBuffer)
 
@@ -150,6 +157,10 @@ func (c *wsClient) connectLoop(ctx context.Context, out chan<- Event) {
 			close(ch)
 			delete(c.fileWaiters, id)
 		}
+		// Drop any abandoned-transfer bookkeeping: simplex-chat's fileIds are
+		// session-scoped, so a late completion will never arrive on a new
+		// connection. The orphan is left for the age sweeper as a last resort.
+		clear(c.abandoned)
 		c.mu.Unlock()
 		_ = conn.Close(websocket.StatusNormalClosure, "")
 
@@ -442,11 +453,50 @@ func (c *wsClient) ReceiveFile(ctx context.Context, fileID int64, destPath strin
 	select {
 	case e := <-ch:
 		if e != nil {
+			// Transfer error / connection lost: simplex-chat may have written a
+			// partial file at destPath. The waiter is already gone (deliverFile
+			// or connectLoop deleted it), so no late completion will arrive for
+			// this fileId; remove the orphan now.
+			c.removeReceivedFile(fileID, destPath)
 			return "", e
 		}
 		return destPath, nil
 	case <-ctx.Done():
+		// Timeout/cancel: we are abandoning the transfer. simplex-chat keeps
+		// running and may finish writing destPath at any point, including after
+		// our os.Remove below (the post-timeout write race). Register destPath as
+		// abandoned first so a late, otherwise-unrouted rcvFileComplete cleans up
+		// whatever lands there, then best-effort remove anything already written.
+		c.markAbandoned(fileID, destPath)
+		c.removeReceivedFile(fileID, destPath)
 		return "", ctx.Err()
+	}
+}
+
+// markAbandoned records destPath so a late rcvFileComplete/rcvFileError for
+// fileId (one that arrives after ReceiveFile gave up and removed its waiter)
+// can remove the file simplex-chat finished writing post-timeout.
+func (c *wsClient) markAbandoned(fileID int64, destPath string) {
+	if destPath == "" {
+		return
+	}
+	c.mu.Lock()
+	if c.abandoned == nil {
+		c.abandoned = make(map[int64]string)
+	}
+	c.abandoned[fileID] = destPath
+	c.mu.Unlock()
+}
+
+// removeReceivedFile best-effort deletes a possibly-partial file simplex-chat
+// wrote for an abandoned/failed transfer. A missing file is not an error (it may
+// never have been created, or a late completion may have already cleaned it up).
+func (c *wsClient) removeReceivedFile(fileID int64, destPath string) {
+	if destPath == "" {
+		return
+	}
+	if err := os.Remove(destPath); err != nil && !errors.Is(err, os.ErrNotExist) {
+		c.log.Warn("simplex: remove orphaned inbox file", "file_id", fileID, "path", destPath, "err", err)
 	}
 }
 
@@ -483,10 +533,22 @@ func (c *wsClient) deliverFile(raw json.RawMessage, recvErr error) {
 	if ok {
 		delete(c.fileWaiters, id)
 	}
+	abandonedPath, wasAbandoned := c.abandoned[id]
+	if wasAbandoned {
+		delete(c.abandoned, id)
+	}
 	c.mu.Unlock()
 	if ok {
 		ch <- recvErr
 		close(ch)
+		return
+	}
+	// No live waiter: ReceiveFile already returned. If it abandoned this fileId
+	// on timeout/cancel, simplex-chat finished the write after we removed it (or
+	// before we got a chance to); clean up the now-orphaned file. Both an error
+	// and a "complete" land here as junk the caller was told it would not get.
+	if wasAbandoned {
+		c.removeReceivedFile(id, abandonedPath)
 	}
 }
 

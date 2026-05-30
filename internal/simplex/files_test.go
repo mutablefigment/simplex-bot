@@ -2,9 +2,106 @@ package simplex
 
 import (
 	"encoding/json"
+	"io"
+	"log/slog"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
+
+func discardClient() *wsClient {
+	return &wsClient{
+		log:         slog.New(slog.NewTextHandler(io.Discard, nil)),
+		fileWaiters: make(map[int64]chan error),
+		abandoned:   make(map[int64]string),
+	}
+}
+
+// TestRemoveReceivedFile covers the best-effort cleanup helper used on the
+// abandon/failure paths: it deletes an existing file, tolerates a missing one,
+// and no-ops on an empty path.
+func TestRemoveReceivedFile(t *testing.T) {
+	c := discardClient()
+
+	dir := t.TempDir()
+	existing := filepath.Join(dir, "partial.bin")
+	if err := os.WriteFile(existing, []byte("partial"), 0o600); err != nil {
+		t.Fatalf("seed file: %v", err)
+	}
+	c.removeReceivedFile(7, existing)
+	if _, err := os.Stat(existing); !os.IsNotExist(err) {
+		t.Fatalf("expected %s removed, stat err = %v", existing, err)
+	}
+
+	// Missing file: must not panic or report (idempotent).
+	c.removeReceivedFile(7, filepath.Join(dir, "never_existed.bin"))
+
+	// Empty destPath (the /freceive-without-path case): no-op.
+	c.removeReceivedFile(7, "")
+}
+
+// TestDeliverFile_LateCompletionCleansAbandoned exercises the post-timeout write
+// race: ReceiveFile already gave up (no waiter) but registered destPath as
+// abandoned, then simplex-chat finishes writing and emits a late, otherwise
+// unrouted rcvFileComplete. deliverFile must remove the now-orphaned file and
+// drop the bookkeeping.
+func TestDeliverFile_LateCompletionCleansAbandoned(t *testing.T) {
+	c := discardClient()
+
+	dir := t.TempDir()
+	orphan := filepath.Join(dir, "late.png")
+	if err := os.WriteFile(orphan, []byte("bytes simplex wrote after timeout"), 0o600); err != nil {
+		t.Fatalf("seed file: %v", err)
+	}
+	c.markAbandoned(9, orphan)
+
+	const ev = `{"type":"rcvFileComplete","chatItem":{"chatItem":{"file":{"fileId":9,"fileName":"late.png"}}}}`
+	c.deliverFile(json.RawMessage(ev), nil)
+
+	if _, err := os.Stat(orphan); !os.IsNotExist(err) {
+		t.Fatalf("late completion did not remove orphan, stat err = %v", err)
+	}
+	c.mu.Lock()
+	_, still := c.abandoned[9]
+	c.mu.Unlock()
+	if still {
+		t.Fatal("abandoned bookkeeping not cleared after late completion")
+	}
+}
+
+// TestDeliverFile_SuccessKeepsFile is the correctness guard: when a live waiter
+// is present (the success path), deliverFile must route the completion to that
+// waiter and must NOT remove destPath — the caller still has to read it.
+func TestDeliverFile_SuccessKeepsFile(t *testing.T) {
+	c := discardClient()
+
+	dir := t.TempDir()
+	good := filepath.Join(dir, "good.png")
+	if err := os.WriteFile(good, []byte("real payload"), 0o600); err != nil {
+		t.Fatalf("seed file: %v", err)
+	}
+
+	ch := make(chan error, 1)
+	c.mu.Lock()
+	c.fileWaiters[9] = ch
+	c.mu.Unlock()
+
+	const ev = `{"type":"rcvFileComplete","chatItem":{"chatItem":{"file":{"fileId":9,"fileName":"good.png"}}}}`
+	c.deliverFile(json.RawMessage(ev), nil)
+
+	select {
+	case e := <-ch:
+		if e != nil {
+			t.Fatalf("success completion delivered error: %v", e)
+		}
+	default:
+		t.Fatal("completion was not routed to the live waiter")
+	}
+	if _, err := os.Stat(good); err != nil {
+		t.Fatalf("success path must keep destPath, stat err = %v", err)
+	}
+}
 
 func TestBuildReceiveCmd(t *testing.T) {
 	if got, want := buildReceiveCmd(7, "/inbox/1700000000_a.png"), "/freceive 7 /inbox/1700000000_a.png"; got != want {
