@@ -20,6 +20,19 @@ const (
 	stderrTailBytes = 8 * 1024
 	sigtermGrace    = 5 * time.Second
 	eventBuffer     = 32
+
+	// readGrace bounds how long the stdout reader (parseStream) is allowed to
+	// keep blocking on Read after ctx is done. ctx (the bot's turnCtx) always
+	// fires (turn timeout or /stop), and cmd.Cancel sends SIGTERM on that, so a
+	// well-behaved claude reaches EOF almost immediately. readGrace is the guard
+	// for the adversarial case where EOF never comes — e.g. claude exits but an
+	// orphaned grandchild inherited and still holds the stdout write-end open, or
+	// claude ignores SIGTERM. After ctx is done + readGrace, the watchdog
+	// force-closes stdout to unblock the Read so supervise can return. It is kept
+	// shorter than sigtermGrace (cmd.WaitDelay) so the read is unblocked before
+	// (or no later than) os/exec's own WaitDelay-driven pipe close, making
+	// supervise's return time bounded by readGrace rather than WaitDelay.
+	readGrace = 1 * time.Second
 )
 
 type Runner interface {
@@ -102,10 +115,29 @@ func (r *execRunner) supervise(
 ) {
 	defer close(out)
 
+	// Read-then-reap (issue #31). The previous order called cmd.Wait() *before*
+	// parseStream had drained stdout. cmd.Wait() closes the read end of the
+	// stdout pipe once it sees the process exit (os/exec owns that fd via
+	// StdoutPipe), so any bytes still buffered in the pipe — typically claude's
+	// final `result` frame carrying cost/duration/terminal result — were
+	// discarded, and the turn was misreported as `ErrCrash: no result event`.
+	//
+	// Correct order: let parseStream run to EOF first, *then* cmd.Wait(). EOF on
+	// the stdout pipe occurs only once every write-end is closed (claude and any
+	// child it spawned that inherited the fd), so by the time parseStream returns
+	// it has observed every byte claude flushed, including the result frame.
+	//
+	// The hazard of read-then-reap is a hang: if EOF never comes (an orphaned
+	// grandchild keeps the stdout write-end open, or claude ignores SIGTERM and
+	// keeps writing), the parse goroutine blocks in Read forever and wg.Wait()
+	// below would never return. The watchdog goroutine is the explicit guard
+	// against that — see closeWatchdog. We do NOT rely on os/exec's WaitDelay
+	// internals to rescue us, because cmd.Wait() is only reached *after* the
+	// parser finishes; the watchdog is what guarantees the parser finishes.
 	var (
-		organic *ResultEvent
+		organic  *ResultEvent
 		parseErr error
-		wg      sync.WaitGroup
+		wg       sync.WaitGroup
 	)
 	wg.Add(1)
 	go func() {
@@ -113,8 +145,17 @@ func (r *execRunner) supervise(
 		organic, parseErr = parseStream(ctx, stdout, out)
 	}()
 
-	waitErr := cmd.Wait()
+	// Watchdog: once ctx is done (turnCtx always fires) plus a short grace,
+	// force-close stdout so a wedged parseStream Read is unblocked and wg.Wait()
+	// can return. stopWatchdog cleans it up on the normal path.
+	stopWatchdog := r.closeWatchdog(ctx, stdout)
+
+	// Wait for the reader to drain stdout to EOF (or to be force-unblocked by the
+	// watchdog) BEFORE reaping the process, so no buffered bytes are lost.
 	wg.Wait()
+	stopWatchdog()
+
+	waitErr := cmd.Wait()
 
 	stderrText := stderrTail.String()
 	terminal := r.terminalResult(ctx, organic, waitErr, parseErr, stderrText)
@@ -144,6 +185,56 @@ func (r *execRunner) supervise(
 	case out <- terminal:
 	case <-ctx.Done():
 	}
+}
+
+// closeWatchdog starts a goroutine that force-closes stdout if ctx finishes and
+// the reader has not already finished within readGrace. It returns a stop func
+// that supervise calls on the normal path (after parseStream reached EOF) to
+// tear the watchdog down without ever touching stdout.
+//
+// Why this can't deadlock: the only way wg.Wait() in supervise blocks forever is
+// a parseStream Read that never returns. That Read returns when (a) the pipe hits
+// EOF — every write-end closed — or (b) the pipe's read end is closed. The
+// watchdog guarantees (b): ctx (the bot's turnCtx) is ALWAYS cancelled (turn
+// timeout or /stop), so the <-ctx.Done() arm always fires; readGrace later it
+// calls stdout.Close(), which makes the blocked Read return an error promptly.
+// supervise therefore returns within readGrace of ctx being done in the worst
+// case, with no dependence on claude exiting or on os/exec's WaitDelay.
+//
+// Why the stdout.Close() vs parseStream Read race is safe: stdout is the read
+// end of an os.Pipe (an *os.File). os.File.Close is safe for concurrent use and
+// is idempotent — its internal poll.FD serializes Close against an in-flight
+// Read and wakes the Read with a "file already closed" / EOF-ish error rather
+// than corrupting state or panicking. parseStream treats any read error as
+// end-of-stream (it returns the organic result and a possibly-non-nil err; on a
+// cancelled ctx terminalResult discards parseErr in favour of ErrTimeout), so a
+// force-close cannot manufacture a bogus success. The same fd is also closed by
+// os/exec inside cmd.Wait() (and possibly by its WaitDelay path); a double/
+// concurrent Close on an *os.File is harmless — one caller wins, the other gets
+// ErrClosed — so the watchdog racing os/exec is fine. Crucially the watchdog is
+// stopped (stopWatchdog) before cmd.Wait() on the normal path, so in the common
+// case only os/exec ever closes the fd.
+func (r *execRunner) closeWatchdog(ctx context.Context, stdout io.Closer) func() {
+	done := make(chan struct{})
+	go func() {
+		select {
+		case <-done:
+			// Normal path: parseStream reached EOF and supervise stopped us.
+			return
+		case <-ctx.Done():
+		}
+		// ctx is done. Give a well-behaved claude (SIGTERM'd via cmd.Cancel) a
+		// brief grace to flush and close its stdout naturally — preserving the
+		// final result frame on the clean-cancel path — then force the issue.
+		select {
+		case <-done:
+			return
+		case <-time.After(readGrace):
+		}
+		_ = stdout.Close()
+	}()
+	var once sync.Once
+	return func() { once.Do(func() { close(done) }) }
 }
 
 func (r *execRunner) terminalResult(
