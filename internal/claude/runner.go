@@ -132,7 +132,18 @@ func (r *execRunner) supervise(
 		"duration_ms", terminal.DurationMS,
 		"err", terminal.Error,
 	)
-	out <- terminal
+	// Context-aware send of the terminal ResultEvent (issue #27). The consumer
+	// (runTurn in internal/bot) stops draining `out` the instant the turn ctx is
+	// cancelled (/stop or turn timeout). If ctx is already cancelled and at least
+	// eventBuffer (32) events are still buffered, a bare `out <- terminal` would
+	// block forever on the full channel against a dead consumer, leaking this
+	// supervise goroutine (plus the retained channel and stderrTail) per
+	// cancelled/timed-out turn. Selecting on ctx.Done() lets supervise exit and
+	// the deferred close(out) fire even when nobody reads the final event.
+	select {
+	case out <- terminal:
+	case <-ctx.Done():
+	}
 }
 
 func (r *execRunner) terminalResult(
