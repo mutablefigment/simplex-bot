@@ -176,6 +176,49 @@ func (s *sqliteStore) TotalCost(ctx context.Context) (float64, error) {
 	return v.Float64, nil
 }
 
+func (s *sqliteStore) TurnCount(ctx context.Context) (int, error) {
+	var n int
+	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM turns`).Scan(&n); err != nil {
+		return 0, err
+	}
+	return n, nil
+}
+
+func (s *sqliteStore) LatestTurn(ctx context.Context) (Turn, bool, error) {
+	var (
+		t         Turn
+		sessionID sql.NullString
+		startedAt string
+		endedAt   sql.NullString
+		cost      sql.NullFloat64
+		status    sql.NullString
+		errStr    sql.NullString
+	)
+	err := s.db.QueryRowContext(ctx,
+		`SELECT id, session_id, started_at, ended_at, cost_usd, status, error
+		   FROM turns ORDER BY id DESC LIMIT 1`).
+		Scan(&t.ID, &sessionID, &startedAt, &endedAt, &cost, &status, &errStr)
+	if errors.Is(err, sql.ErrNoRows) {
+		return Turn{}, false, nil
+	}
+	if err != nil {
+		return Turn{}, false, err
+	}
+	t.SessionID = sessionID.String
+	t.Status = status.String
+	t.Error = errStr.String
+	t.CostUSD = cost.Float64
+	if started, err := time.Parse(time.RFC3339Nano, startedAt); err == nil {
+		t.StartedAt = started
+	}
+	if endedAt.Valid {
+		if ended, err := time.Parse(time.RFC3339Nano, endedAt.String); err == nil {
+			t.EndedAt = ended
+		}
+	}
+	return t, true, nil
+}
+
 func boolToInt(b bool) int {
 	if b {
 		return 1

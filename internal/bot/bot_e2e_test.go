@@ -67,7 +67,7 @@ func TestBot_E2E_Live(t *testing.T) {
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
 	fake := newFakeSimplex()
 	cr := claude.NewRunner(cfg.Claude, log)
-	b := New(cfg, log, fake, cr, st)
+	b := New(cfg, log, "test", fake, cr, st)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 	defer cancel()
@@ -201,7 +201,7 @@ func TestBot_E2E_StopMidTurn(t *testing.T) {
 	log := slog.New(slog.NewTextHandler(logOut, &slog.HandlerOptions{Level: slog.LevelDebug}))
 	fake := newFakeSimplex()
 	cr := claude.NewRunner(cfg.Claude, log)
-	b := New(cfg, log, fake, cr, st)
+	b := New(cfg, log, "test", fake, cr, st)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 	defer cancel()

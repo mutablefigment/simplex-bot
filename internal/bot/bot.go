@@ -20,6 +20,7 @@ const queueDepth = 16
 type Bot struct {
 	cfg     *config.Config
 	log     *slog.Logger
+	version string
 	simplex simplex.Client
 	claude  claude.Runner
 	store   store.Store
@@ -44,6 +45,7 @@ type job struct {
 func New(
 	cfg *config.Config,
 	log *slog.Logger,
+	version string,
 	sx simplex.Client,
 	cr claude.Runner,
 	st store.Store,
@@ -51,6 +53,7 @@ func New(
 	return &Bot{
 		cfg:     cfg,
 		log:     log,
+		version: version,
 		simplex: sx,
 		claude:  cr,
 		store:   st,
@@ -205,14 +208,72 @@ func (b *Bot) runSlash(ctx context.Context, j job) {
 		_, _ = b.simplex.Send(ctx, j.contactID, "session cleared", j.itemID)
 	case "help":
 		_, _ = b.simplex.Send(ctx, j.contactID, helpText, j.itemID)
+	case "status":
+		_, _ = b.simplex.Send(ctx, j.contactID, b.statusText(ctx), j.itemID)
+	case "cost":
+		_, _ = b.simplex.Send(ctx, j.contactID, b.costText(ctx), j.itemID)
 	default:
 		_, _ = b.simplex.Send(ctx, j.contactID, "unknown command: /"+j.slash.Name, j.itemID)
 	}
 }
 
+func (b *Bot) statusText(ctx context.Context) string {
+	var lines []string
+	if b.version != "" {
+		lines = append(lines, "version: "+b.version)
+	}
+	sessionID, err := b.store.GetSessionID(ctx)
+	if err != nil {
+		b.log.Error("status: read session", "err", err)
+	}
+	if sessionID == "" {
+		lines = append(lines, "session: (none — next prompt starts fresh)")
+	} else {
+		lines = append(lines, "session: "+shortSession(sessionID))
+	}
+	last, ok, err := b.store.LatestTurn(ctx)
+	if err != nil {
+		b.log.Error("status: read latest turn", "err", err)
+	}
+	if !ok {
+		lines = append(lines, "last turn: (none)")
+	} else {
+		when := last.EndedAt
+		if when.IsZero() {
+			when = last.StartedAt
+		}
+		lines = append(lines, fmt.Sprintf("last turn: %s at %s",
+			last.Status, when.UTC().Format("2006-01-02 15:04:05Z")))
+	}
+	return strings.Join(lines, "\n")
+}
+
+func (b *Bot) costText(ctx context.Context) string {
+	total, err := b.store.TotalCost(ctx)
+	if err != nil {
+		b.log.Error("cost: read total", "err", err)
+		return "⚠️ cost lookup failed — check journal"
+	}
+	count, err := b.store.TurnCount(ctx)
+	if err != nil {
+		b.log.Error("cost: read turn count", "err", err)
+		return "⚠️ cost lookup failed — check journal"
+	}
+	return fmt.Sprintf("$%.4f total over %d turns", total, count)
+}
+
+func shortSession(id string) string {
+	if len(id) <= 8 {
+		return id
+	}
+	return id[:8]
+}
+
 const helpText = `commands:
 /new — start a fresh Claude session
 /stop — cancel the current turn (if any)
+/status — current session + last turn
+/cost — total $ spent + turn count
 /help — show this message
 anything else is sent to Claude as a prompt`
 
