@@ -320,29 +320,45 @@ func (c *wsClient) sendCommon(ctx context.Context, cmd string) (int64, error) {
 	return resp.ChatItems[0].ChatItem.Meta.ItemID, nil
 }
 
+// buildSendCmd always emits the json composed-message form. The plain
+// `/_send @<cid> [live=on] text <body>` form would concatenate `text` directly
+// into the command string; any newline, CR, or other control byte in the body
+// terminates the command early at simplex-chat's parser and lets the remainder
+// be re-interpreted as a fresh CLI command. JSON-encoded bodies escape control
+// characters, so embedded newlines stay inside the msgContent field.
 func buildSendCmd(contactID int64, text string, quotedItemID int64, live bool) string {
 	liveFlag := ""
 	if live {
 		liveFlag = " live=on"
 	}
-	if quotedItemID == 0 {
-		return fmt.Sprintf("/_send @%d%s text %s", contactID, liveFlag, text)
+	msg := map[string]any{
+		"msgContent": map[string]any{"type": "text", "text": text},
 	}
-	payload, _ := json.Marshal([]map[string]any{{
-		"msgContent":   map[string]any{"type": "text", "text": text},
-		"quotedItemId": quotedItemID,
-	}})
+	if quotedItemID != 0 {
+		msg["quotedItemId"] = quotedItemID
+	}
+	payload, _ := json.Marshal([]map[string]any{msg})
 	return fmt.Sprintf("/_send @%d%s json %s", contactID, liveFlag, payload)
 }
 
+// buildUpdateCmd emits `/_update item @<cid> <itemId> [live=on] json {...}` for
+// the same reason as buildSendCmd: a `text <body>` suffix concatenates the body
+// into the command string and is vulnerable to newline injection.
+func buildUpdateCmd(contactID, itemID int64, text string, live bool) string {
+	liveFlag := ""
+	if live {
+		liveFlag = " live=on"
+	}
+	payload, _ := json.Marshal(map[string]any{"type": "text", "text": text})
+	return fmt.Sprintf("/_update item @%d %d%s json %s", contactID, itemID, liveFlag, payload)
+}
+
 func (c *wsClient) UpdateLive(ctx context.Context, contactID, itemID int64, text string) error {
-	cmd := fmt.Sprintf("/_update item @%d %d live=on text %s", contactID, itemID, text)
-	return c.expectUpdate(ctx, cmd)
+	return c.expectUpdate(ctx, buildUpdateCmd(contactID, itemID, text, true))
 }
 
 func (c *wsClient) Finalise(ctx context.Context, contactID, itemID int64, text string) error {
-	cmd := fmt.Sprintf("/_update item @%d %d text %s", contactID, itemID, text)
-	return c.expectUpdate(ctx, cmd)
+	return c.expectUpdate(ctx, buildUpdateCmd(contactID, itemID, text, false))
 }
 
 func (c *wsClient) expectUpdate(ctx context.Context, cmd string) error {
