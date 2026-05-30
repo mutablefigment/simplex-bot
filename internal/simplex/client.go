@@ -17,6 +17,9 @@ type Client interface {
 	SendLive(ctx context.Context, contactID int64, text string, quotedItemID int64) (itemID int64, err error)
 	UpdateLive(ctx context.Context, contactID, itemID int64, text string) error
 	Finalise(ctx context.Context, contactID, itemID int64, text string) error
+	// ReceiveFile downloads an offered inbound attachment to destPath, blocking
+	// until the transfer completes. Returns the path the bytes were written to.
+	ReceiveFile(ctx context.Context, fileID int64, destPath string) (string, error)
 	Close() error
 }
 

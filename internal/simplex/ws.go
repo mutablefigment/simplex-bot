@@ -29,9 +29,10 @@ type wsClient struct {
 	cfg config.Simplex
 	log *slog.Logger
 
-	mu      sync.Mutex
-	conn    *websocket.Conn
-	pending map[string]chan responseFrame
+	mu          sync.Mutex
+	conn        *websocket.Conn
+	pending     map[string]chan responseFrame
+	fileWaiters map[int64]chan error // fileId -> completion signal for ReceiveFile
 
 	corrCtr atomic.Int64
 	closed  atomic.Bool
@@ -78,11 +79,24 @@ type chatItemBlock struct {
 		QuotedItem *struct {
 			ItemID int64 `json:"itemId"`
 		} `json:"quotedItem,omitempty"`
+		File *ciFileBlock `json:"file,omitempty"`
 	} `json:"chatItem"`
+}
+
+// ciFileBlock mirrors simplex-chat's CIFile: the attachment metadata that hangs
+// off a chat item alongside its msgContent.
+type ciFileBlock struct {
+	FileID     int64  `json:"fileId"`
+	FileName   string `json:"fileName"`
+	FileSize   int64  `json:"fileSize"`
+	FileStatus struct {
+		Type string `json:"type"`
+	} `json:"fileStatus"`
 }
 
 func (c *wsClient) Run(ctx context.Context) (<-chan Event, error) {
 	c.pending = make(map[string]chan responseFrame)
+	c.fileWaiters = make(map[int64]chan error)
 	c.done = make(chan struct{})
 	out := make(chan Event, eventBuffer)
 
@@ -130,6 +144,11 @@ func (c *wsClient) connectLoop(ctx context.Context, out chan<- Event) {
 		for id, ch := range c.pending {
 			close(ch)
 			delete(c.pending, id)
+		}
+		for id, ch := range c.fileWaiters {
+			ch <- errors.New("simplex: connection lost during file transfer")
+			close(ch)
+			delete(c.fileWaiters, id)
 		}
 		c.mu.Unlock()
 		_ = conn.Close(websocket.StatusNormalClosure, "")
@@ -211,8 +230,22 @@ func (c *wsClient) handlePush(ctx context.Context, typ string, raw json.RawMessa
 			if it.ChatItem.QuotedItem != nil {
 				ev.QuotedItemID = it.ChatItem.QuotedItem.ItemID
 			}
+			// An inbound attachment arrives as a sibling `file` block that still
+			// needs pulling down (status rcvInvitation). The bot picks the
+			// destination and calls ReceiveFile.
+			if f := it.ChatItem.File; f != nil && f.FileID != 0 && f.FileStatus.Type == "rcvInvitation" {
+				ev.Files = append(ev.Files, File{ID: f.FileID, Name: f.FileName, Size: f.FileSize})
+			}
 			emit(ctx, out, ev)
 		}
+	case "rcvFileComplete":
+		c.deliverFile(raw, nil)
+	case "rcvFileError", "rcvFileSndCancelled":
+		c.deliverFile(raw, fmt.Errorf("simplex: file transfer %s", typ))
+	case "rcvFileStart", "rcvFileAccepted", "rcvFileDescrReady":
+		// progress events for an in-flight transfer; completion is signalled
+		// by rcvFileComplete/rcvFileError, which is what ReceiveFile waits on.
+		c.log.Debug("simplex: file transfer progress", "type", typ)
 	case "chatItemsStatusesUpdated", "chatItemUpdated",
 		"contactSubSummary", "userContactSubSummary", "memberSubSummary",
 		"pendingSubSummary", "terminalEvent":
@@ -370,6 +403,91 @@ func (c *wsClient) expectUpdate(ctx context.Context, cmd string) error {
 		return fmt.Errorf("simplex: unexpected response type %q for update", frame.typ)
 	}
 	return nil
+}
+
+// ReceiveFile pulls an offered inbound file (by fileId) down to destPath and
+// blocks until the transfer completes. It sends /freceive, confirms the
+// rcvFileAccepted response, then waits for the rcvFileComplete push so the
+// caller knows the bytes are fully on disk before reading them. On success it
+// returns destPath (the location we asked simplex-chat to write to).
+func (c *wsClient) ReceiveFile(ctx context.Context, fileID int64, destPath string) (string, error) {
+	ch := make(chan error, 1)
+	c.mu.Lock()
+	if c.fileWaiters == nil {
+		c.fileWaiters = make(map[int64]chan error)
+	}
+	c.fileWaiters[fileID] = ch
+	c.mu.Unlock()
+	defer func() {
+		c.mu.Lock()
+		if c.fileWaiters[fileID] == ch {
+			delete(c.fileWaiters, fileID)
+		}
+		c.mu.Unlock()
+	}()
+
+	frame, err := c.call(ctx, buildReceiveCmd(fileID, destPath))
+	if err != nil {
+		return "", err
+	}
+	switch frame.typ {
+	case "rcvFileAccepted":
+		// transfer started; fall through to await completion.
+	case "rcvFileAcceptedSndCancelled":
+		return "", fmt.Errorf("simplex: sender cancelled file %d", fileID)
+	default:
+		return "", fmt.Errorf("simplex: unexpected response %q to /freceive", frame.typ)
+	}
+
+	select {
+	case e := <-ch:
+		if e != nil {
+			return "", e
+		}
+		return destPath, nil
+	case <-ctx.Done():
+		return "", ctx.Err()
+	}
+}
+
+// buildReceiveCmd renders /freceive. destPath, when set, tells simplex-chat
+// where to write the file; the path must not contain spaces (the command
+// grammar is whitespace-delimited), which the caller guarantees by sanitising.
+func buildReceiveCmd(fileID int64, destPath string) string {
+	if destPath == "" {
+		return fmt.Sprintf("/freceive %d", fileID)
+	}
+	return fmt.Sprintf("/freceive %d %s", fileID, destPath)
+}
+
+// deliverFile routes an rcvFileComplete/rcvFileError push to the ReceiveFile
+// waiter registered for that fileId.
+func (c *wsClient) deliverFile(raw json.RawMessage, recvErr error) {
+	var resp struct {
+		ChatItem struct {
+			ChatItem struct {
+				File *ciFileBlock `json:"file"`
+			} `json:"chatItem"`
+		} `json:"chatItem"`
+	}
+	if err := json.Unmarshal(raw, &resp); err != nil {
+		c.log.Warn("simplex: decode file event", "err", err)
+		return
+	}
+	if resp.ChatItem.ChatItem.File == nil {
+		return
+	}
+	id := resp.ChatItem.ChatItem.File.FileID
+	c.mu.Lock()
+	ch, ok := c.fileWaiters[id]
+	if ok {
+		delete(c.fileWaiters, id)
+	}
+	c.mu.Unlock()
+	if ok {
+		ch <- recvErr
+		close(ch)
+	}
 }
 
 func (c *wsClient) Close() error {

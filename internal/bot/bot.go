@@ -5,6 +5,8 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -15,7 +17,12 @@ import (
 	"claude-bot/internal/store"
 )
 
-const queueDepth = 16
+const (
+	queueDepth = 16
+	// fileReceiveTimeout bounds how long we wait for a single inbound
+	// attachment to download before giving up on it.
+	fileReceiveTimeout = 2 * time.Minute
+)
 
 type Bot struct {
 	cfg     *config.Config
@@ -148,22 +155,33 @@ func (b *Bot) handleChatItem(ctx context.Context, ev simplex.ChatItemsEvent) {
 	}
 
 	text := strings.TrimSpace(ev.Text)
-	if text == "" {
+	if text == "" && len(ev.Files) == 0 {
 		return
 	}
 
-	// /stop is handled out-of-queue: by the time it would dequeue, the turn
-	// it's trying to cancel would already be over.
-	if cmd, ok := parseCommand(text); ok && cmd.Name == "stop" {
-		b.handleStop(ctx, ev)
-		return
+	// Slash commands are text-only; a message carrying attachments is always a
+	// prompt. /stop is handled out-of-queue: by the time it would dequeue, the
+	// turn it's trying to cancel would already be over.
+	if len(ev.Files) == 0 {
+		if cmd, ok := parseCommand(text); ok && cmd.Name == "stop" {
+			b.handleStop(ctx, ev)
+			return
+		}
 	}
 
 	j := job{itemID: ev.ItemID, contactID: ev.ContactID, receivedAt: time.Now()}
-	if cmd, ok := parseCommand(text); ok {
+	if cmd, ok := parseCommand(text); ok && len(ev.Files) == 0 {
 		j.slash = &cmd
 	} else {
-		j.prompt = text
+		// Pull any attachments into the inbox and reference them in the prompt.
+		// A file-only message (no caption) is still a valid prompt.
+		refs := b.ingestFiles(ctx, ev)
+		j.prompt = withAttachments(text, refs)
+		if j.prompt == "" {
+			// No caption and every attachment failed to download — nothing to
+			// ask Claude. ingestFiles has already told the user what broke.
+			return
+		}
 	}
 
 	select {
@@ -177,6 +195,101 @@ func (b *Bot) handleChatItem(ctx context.Context, ev simplex.ChatItemsEvent) {
 		b.log.Warn("queue full; dropping message")
 		_, _ = b.simplex.Send(ctx, ev.ContactID, "⚠️ busy — message dropped (queue full)", ev.ItemID)
 	}
+}
+
+// ingestFiles downloads each attachment on ev into the inbox and returns the
+// workspace-relative paths to reference in the prompt. Failures are reported to
+// the user and skipped rather than aborting the whole message. It runs on the
+// event-loop goroutine and blocks while each transfer completes; for a
+// single-user bot over loopback that's acceptable, and the per-file timeout
+// bounds the stall.
+func (b *Bot) ingestFiles(ctx context.Context, ev simplex.ChatItemsEvent) []string {
+	if len(ev.Files) == 0 {
+		return nil
+	}
+	inbox := b.cfg.Storage.InboxDir
+	if inbox == "" {
+		inbox = filepath.Join(b.cfg.Claude.Workspace, "inbox")
+	}
+	if err := os.MkdirAll(inbox, 0o700); err != nil {
+		b.log.Error("inbox mkdir", "dir", inbox, "err", err)
+		_, _ = b.simplex.Send(ctx, ev.ContactID, "⚠️ couldn't prepare inbox for attachments", ev.ItemID)
+		return nil
+	}
+
+	ts := time.Now().Unix()
+	var refs []string
+	for _, f := range ev.Files {
+		safe := safeFileName(f.Name)
+		dest := filepath.Join(inbox, fmt.Sprintf("%d_%s", ts, safe))
+
+		rctx, cancel := context.WithTimeout(ctx, fileReceiveTimeout)
+		path, err := b.simplex.ReceiveFile(rctx, f.ID, dest)
+		cancel()
+		if err != nil {
+			b.log.Error("receive attachment", "name", safe, "file_id", f.ID, "err", err)
+			_, _ = b.simplex.Send(ctx, ev.ContactID,
+				fmt.Sprintf("⚠️ couldn't receive attachment %q: %v", safe, err), ev.ItemID)
+			continue
+		}
+		refs = append(refs, b.promptPath(path))
+		b.log.Info("attachment received", "name", safe, "bytes", f.Size)
+	}
+	return refs
+}
+
+// promptPath renders a received file's path as it should appear in the prompt:
+// relative to the workspace (so Claude's cwd-relative tools resolve it) when it
+// lives under the workspace, else the absolute path.
+func (b *Bot) promptPath(path string) string {
+	if rel, err := filepath.Rel(b.cfg.Claude.Workspace, path); err == nil && !strings.HasPrefix(rel, "..") {
+		return "./" + filepath.ToSlash(rel)
+	}
+	return path
+}
+
+// withAttachments appends an [attached: …] line per file to the caption. The
+// caption may be empty (file-only message), in which case the prompt is just
+// the attachment references.
+func withAttachments(caption string, refs []string) string {
+	parts := make([]string, 0, len(refs)+1)
+	if caption != "" {
+		parts = append(parts, caption)
+	}
+	for _, r := range refs {
+		parts = append(parts, fmt.Sprintf("[attached: %s]", r))
+	}
+	return strings.Join(parts, "\n")
+}
+
+// safeFileName reduces an attacker-controlled filename to a single safe path
+// component: no directory separators, no parent refs, no leading dots, no
+// whitespace (the /freceive grammar is space-delimited) or control characters.
+func safeFileName(name string) string {
+	// Cut to the last path component, honouring both separators — a filename
+	// may come from a Windows client even when we run on a unix host.
+	if i := strings.LastIndexAny(name, `/\`); i >= 0 {
+		name = name[i+1:]
+	}
+	name = strings.Map(func(r rune) rune {
+		switch {
+		case r == '/' || r == '\\':
+			return '_'
+		case r <= ' ' || r == 0x7f:
+			return '_'
+		default:
+			return r
+		}
+	}, name)
+	name = strings.TrimLeft(name, ".")
+	if name == "" {
+		return "file"
+	}
+	const maxLen = 128
+	if len(name) > maxLen {
+		name = name[:maxLen]
+	}
+	return name
 }
 
 func (b *Bot) handleStop(ctx context.Context, ev simplex.ChatItemsEvent) {
