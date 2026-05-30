@@ -157,6 +157,87 @@ func TestIngestFiles_BothSanitiseToFile(t *testing.T) {
 	}
 }
 
+// TestIngestFiles_OversizedSkipped covers issue #33: an attachment whose wire
+// size exceeds storage.max_attachment_size is skipped (and the user notified)
+// before ReceiveFile is called, while an under-cap sibling in the same message
+// is still received and referenced in the prompt.
+func TestIngestFiles_OversizedSkipped(t *testing.T) {
+	fake := newFakeSimplex()
+	b := newAttachmentBot(t, fake)
+	b.cfg.Storage.MaxAttachmentSize = config.ByteSize(1000) // 1000-byte cap
+
+	b.handleChatItem(context.Background(), simplex.ChatItemsEvent{
+		ContactID: 42,
+		ItemID:    13,
+		Text:      "here",
+		Files: []simplex.File{
+			{ID: 200, Name: "huge.bin", Size: 5000}, // over the cap -> skipped
+			{ID: 201, Name: "small.txt", Size: 10},  // under the cap -> received
+		},
+	})
+
+	j := dequeue(t, b)
+
+	// Only the under-cap file is referenced in the prompt.
+	if n := strings.Count(j.prompt, "[attached: ./inbox/"); n != 1 {
+		t.Fatalf("prompt = %q, want exactly 1 attachment reference", j.prompt)
+	}
+	if !strings.HasSuffix(j.prompt, "_small.txt]") {
+		t.Errorf("prompt = %q, want the under-cap small.txt referenced", j.prompt)
+	}
+	if strings.Contains(j.prompt, "huge.bin") {
+		t.Errorf("prompt = %q, oversized huge.bin must not be referenced", j.prompt)
+	}
+
+	// ReceiveFile was called exactly once, for the under-cap file only.
+	dests := receiveDests(fake)
+	if len(dests) != 1 {
+		t.Fatalf("ReceiveFile called %d times, want 1; dests = %v", len(dests), dests)
+	}
+	if !strings.HasSuffix(dests[0], "_small.txt") {
+		t.Errorf("received dest %q, want the under-cap small.txt", dests[0])
+	}
+	if !strings.Contains(dests[0], "_201_") {
+		t.Errorf("received dest %q did not embed the under-cap fileId 201", dests[0])
+	}
+
+	// The user was notified about the skipped oversized attachment.
+	var warned bool
+	fake.mu.Lock()
+	for _, s := range fake.sends {
+		if s.op == "send" && strings.Contains(s.text, "huge.bin") && strings.Contains(s.text, "too large") {
+			warned = true
+		}
+	}
+	fake.mu.Unlock()
+	if !warned {
+		t.Errorf("no 'too large' notice sent for the skipped attachment")
+	}
+}
+
+// TestIngestFiles_UnlimitedWhenZero confirms a 0 cap means unlimited: even a
+// very large attachment is received.
+func TestIngestFiles_UnlimitedWhenZero(t *testing.T) {
+	fake := newFakeSimplex()
+	b := newAttachmentBot(t, fake)
+	b.cfg.Storage.MaxAttachmentSize = 0 // unlimited
+
+	b.handleChatItem(context.Background(), simplex.ChatItemsEvent{
+		ContactID: 42,
+		ItemID:    14,
+		Text:      "",
+		Files:     []simplex.File{{ID: 300, Name: "big.bin", Size: 1 << 40}},
+	})
+
+	j := dequeue(t, b)
+	if n := strings.Count(j.prompt, "[attached: ./inbox/"); n != 1 {
+		t.Fatalf("prompt = %q, want the large attachment received under a 0 (unlimited) cap", j.prompt)
+	}
+	if dests := receiveDests(fake); len(dests) != 1 {
+		t.Fatalf("ReceiveFile called %d times, want 1; dests = %v", len(dests), dests)
+	}
+}
+
 // receiveDests returns, in order, the destPath argument of every ReceiveFile
 // call recorded by the fake. The fake stores destPath in sentMsg.text.
 func receiveDests(f *fakeSimplex) []string {

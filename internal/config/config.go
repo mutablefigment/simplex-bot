@@ -35,6 +35,11 @@ type Storage struct {
 	DBPath         string   `toml:"db_path"`
 	InboxDir       string   `toml:"inbox_dir"`
 	InboxRetention Duration `toml:"inbox_retention"`
+	// MaxAttachmentSize caps the on-the-wire size of an inbound attachment the
+	// bot will download into the inbox. 0 means unlimited; a positive value
+	// causes oversized attachments to be skipped (and the user notified) before
+	// the transfer starts. Defaults to 100MiB (see applyDefaults).
+	MaxAttachmentSize ByteSize `toml:"max_attachment_size"`
 }
 
 type LiveMessage struct {

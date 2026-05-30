@@ -16,6 +16,10 @@ turn_timeout = "30m"
 db_path = "/var/lib/claude-bot/state.db"
 inbox_dir = "/var/lib/claude-bot/workspace/inbox"
 inbox_retention = "720h"
+# Largest inbound attachment the bot will download. Human-readable: SI suffixes
+# (KB/MB/GB/TB, powers of 1000) and IEC suffixes (KiB/MiB/GiB/TiB, powers of
+# 1024) are both accepted; a bare number is raw bytes. 0 disables the cap.
+max_attachment_size = "100MiB"
 
 [live_message]
 update_interval = "3s"

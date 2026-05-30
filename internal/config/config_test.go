@@ -26,6 +26,9 @@ func TestLoadExample(t *testing.T) {
 	if got := time.Duration(cfg.Storage.InboxRetention); got != 720*time.Hour {
 		t.Errorf("inbox_retention = %v, want 720h", got)
 	}
+	if got := int64(cfg.Storage.MaxAttachmentSize); got != 100<<20 {
+		t.Errorf("max_attachment_size = %d, want %d (100MiB)", got, 100<<20)
+	}
 	if cfg.LiveMessage.ChunkThreshold != 4096 {
 		t.Errorf("chunk_threshold = %d", cfg.LiveMessage.ChunkThreshold)
 	}
@@ -58,6 +61,9 @@ db_path = "/z"
 	}
 	if got := time.Duration(cfg.LiveMessage.UpdateInterval); got != 3*time.Second {
 		t.Errorf("default update_interval = %v", got)
+	}
+	if got := int64(cfg.Storage.MaxAttachmentSize); got != 100<<20 {
+		t.Errorf("default max_attachment_size = %d, want %d (100MiB)", got, 100<<20)
 	}
 	if cfg.Log.Level != "info" {
 		t.Errorf("default log.level = %q", cfg.Log.Level)
