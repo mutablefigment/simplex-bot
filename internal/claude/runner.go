@@ -116,7 +116,17 @@ func (r *execRunner) supervise(
 	waitErr := cmd.Wait()
 	wg.Wait()
 
-	terminal := r.terminalResult(ctx, organic, waitErr, parseErr, stderrTail.String())
+	stderrText := stderrTail.String()
+	terminal := r.terminalResult(ctx, organic, waitErr, parseErr, stderrText)
+	// Log stderr separately and only here: it may contain API key fragments,
+	// account IDs, or stack frames. Never propagate it into terminal.Error,
+	// which gets rendered into a user-visible reply by the bot.
+	if terminal.Error != nil && stderrText != "" {
+		r.log.Error("claude: stderr tail",
+			"err", terminal.Error,
+			"stderr", stderrText,
+		)
+	}
 	r.log.Info("claude: exited",
 		"cost_usd", terminal.CostUSD,
 		"duration_ms", terminal.DurationMS,
@@ -172,26 +182,20 @@ func (r *execRunner) terminalResult(
 	return ev
 }
 
+// classifyStderr only inspects stderr to pick a typed error; the stderr text
+// itself never escapes into the returned error. Stderr may include API key
+// fragments, account identifiers, or stack frames, and the returned error
+// flows directly into a user-visible reply (see bot.errorSuffix). Raw stderr
+// is logged separately at error level in supervise().
 func classifyStderr(base error, stderr string) error {
 	low := strings.ToLower(stderr)
 	switch {
 	case strings.Contains(low, "rate limit") || strings.Contains(low, "rate_limit"):
-		return fmt.Errorf("%w: %s", ErrRateLimit, firstLine(stderr))
+		return ErrRateLimit
 	case strings.Contains(low, "authentication") || strings.Contains(low, "unauthorized") || strings.Contains(low, "api key"):
-		return fmt.Errorf("%w: %s", ErrAuth, firstLine(stderr))
+		return ErrAuth
 	}
-	if stderr == "" {
-		return base
-	}
-	return fmt.Errorf("%w (stderr: %s)", base, firstLine(stderr))
-}
-
-func firstLine(s string) string {
-	s = strings.TrimSpace(s)
-	if i := strings.IndexByte(s, '\n'); i >= 0 {
-		return s[:i]
-	}
-	return s
+	return base
 }
 
 // shortSession returns the first 8 chars of a session id, matching the

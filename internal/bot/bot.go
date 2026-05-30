@@ -343,7 +343,7 @@ func (b *Bot) classifyTurn(turnCtx context.Context, gotTerminal bool, terminal c
 		return "⚠️ interrupted", "cancelled", context.Canceled
 	case !gotTerminal:
 		err := fmt.Errorf("%w: runner closed channel without ResultEvent", claude.ErrCrash)
-		return "⚠️ error: " + err.Error(), "error", err
+		return errorSuffix(err), "error", err
 	case terminal.Error != nil:
 		return errorSuffix(terminal.Error), errorStatus(terminal.Error), terminal.Error
 	default:
@@ -372,18 +372,21 @@ func (b *Bot) finishTurn(ctx context.Context, turnID int64, base store.Turn, sta
 	}
 }
 
+// errorSuffix returns a fixed, opaque suffix for the user-visible reply.
+// Never include err.Error(): claude's stderr/errors may contain API key
+// fragments or account identifiers (issue #4). Operators read journald.
 func errorSuffix(err error) string {
 	switch {
 	case errors.Is(err, claude.ErrTimeout):
 		return "⏱️ timeout"
 	case errors.Is(err, claude.ErrRateLimit):
-		return "🚦 rate limit: " + err.Error()
+		return "🚦 rate limit — check journal"
 	case errors.Is(err, claude.ErrAuth):
-		return "🔑 auth error: " + err.Error()
+		return "🔑 auth error — check journal"
 	case errors.Is(err, context.Canceled):
 		return "⚠️ interrupted"
 	default:
-		return "⚠️ error: " + err.Error()
+		return "⚠️ error — check journal"
 	}
 }
 
