@@ -487,7 +487,14 @@ loop:
 			case claude.AssistantTextEvent:
 				lt.Append(e.Text)
 			case claude.ToolUseEvent:
-				// suppressed in this slice; ShowToolUse honored later.
+				// Surface a tool-use indicator only when configured; the
+				// default (false) path leaves the live message unchanged.
+				// AppendToolUse handles dedup of consecutive identical names
+				// and own-line placement, and the live message lazy-opens on
+				// the next Flush even when tool use precedes any text.
+				if b.cfg.Claude.ShowToolUse {
+					lt.AppendToolUse(e.Name)
+				}
 			case claude.ResultEvent:
 				terminal = e
 				gotTerminal = true

@@ -347,6 +347,131 @@ func TestLiveTurn_SendLiveErrorPropagates(t *testing.T) {
 	}
 }
 
+func TestLiveTurn_ToolIndicatorIsMarkdownFixpoint(t *testing.T) {
+	// The composed tool-use line must survive translateMarkdown unchanged: it
+	// carries none of the chars the translator rewrites (* _ ~ # ` [ !). This
+	// is the contract AppendToolUse relies on, since the buffer is run through
+	// translateMarkdown on every Flush and on Finalise.
+	names := []string{
+		"Read", "Bash", "Grep", "Glob", "Edit", "Write", "WebFetch",
+		"mcp__server__tool", // MCP names contain "__"; "_" is never consumed by the translator
+		"Tool-With-Dash",
+		"NotebookEdit",
+	}
+	for _, n := range names {
+		line := toolUsePrefix + n + "\n"
+		if got := translateMarkdown(line); got != line {
+			t.Errorf("tool line not a fixpoint for %q:\n in  %q\n out %q", n, line, got)
+		}
+		// And embedded between assistant text, the shape runTurn actually builds.
+		blob := "before text\n" + toolUsePrefix + n + "\nafter text"
+		if got := translateMarkdown(blob); got != blob {
+			t.Errorf("interleaved tool line not a fixpoint for %q:\n in  %q\n out %q", n, blob, got)
+		}
+	}
+}
+
+func TestLiveTurn_ToolUseBeforeTextLazyOpens(t *testing.T) {
+	ctx := context.Background()
+	sender := &fakeSender{}
+	lt, _ := newLT(t, sender, 0)
+
+	// Ordering case: a tool-use indicator arrives BEFORE any assistant text.
+	// Nothing on the wire until the first Flush, then the live message must
+	// open via SendLive (lazy-open) carrying the indicator and quoting the
+	// prompt.
+	lt.AppendToolUse("Read")
+	if len(sender.calls) != 0 {
+		t.Fatalf("AppendToolUse touched the wire: %+v", sender.calls)
+	}
+	if err := lt.Flush(ctx); err != nil {
+		t.Fatalf("Flush: %v", err)
+	}
+	if len(sender.calls) != 1 || sender.calls[0].op != "send_live" {
+		t.Fatalf("expected single send_live, got %+v", sender.calls)
+	}
+	if got, want := sender.calls[0].text, "🔧 Read"; got != want {
+		t.Errorf("text = %q, want %q", got, want)
+	}
+	if sender.calls[0].quotedID != 7 {
+		t.Errorf("quotedID = %d, want 7 (prompt quote on first send)", sender.calls[0].quotedID)
+	}
+
+	// Text then follows the indicator on the next line.
+	lt.Append("Here is the file.")
+	_ = lt.Flush(ctx)
+	last := sender.calls[len(sender.calls)-1]
+	if got, want := last.text, "🔧 Read\nHere is the file."; got != want {
+		t.Errorf("after text, full text = %q, want %q", got, want)
+	}
+}
+
+func TestLiveTurn_ToolUseDedupesConsecutive(t *testing.T) {
+	ctx := context.Background()
+	sender := &fakeSender{}
+	lt, _ := newLT(t, sender, 0)
+
+	// A run of identical tool names collapses to a single indicator line.
+	lt.AppendToolUse("Read")
+	lt.AppendToolUse("Read")
+	lt.AppendToolUse("Read")
+	// A different tool produces a fresh line.
+	lt.AppendToolUse("Bash")
+	// Back to a Read after Bash → not a consecutive dup, so a new line.
+	lt.AppendToolUse("Read")
+	// Empty name is ignored entirely.
+	lt.AppendToolUse("")
+
+	_ = lt.Flush(ctx)
+	got := sender.calls[len(sender.calls)-1].text
+	want := "🔧 Read\n🔧 Bash\n🔧 Read"
+	if got != want {
+		t.Errorf("deduped indicators = %q, want %q", got, want)
+	}
+}
+
+func TestLiveTurn_ToolUseEachOnOwnLineInterleaved(t *testing.T) {
+	ctx := context.Background()
+	sender := &fakeSender{}
+	lt, _ := newLT(t, sender, 0)
+
+	// Text, then a tool, then more text, then the SAME tool again. Because
+	// assistant text between two tool uses resets dedup (a new logical run),
+	// the repeated tool name is shown again rather than collapsed.
+	lt.Append("Let me check.")
+	lt.AppendToolUse("Read")
+	lt.Append("Found it. Now editing.")
+	lt.AppendToolUse("Read") // same name, but separated by text → not a dup
+	lt.Append("Done.")
+
+	_ = lt.Flush(ctx)
+	got := sender.calls[len(sender.calls)-1].text
+	want := "Let me check.\n🔧 Read\nFound it. Now editing.\n🔧 Read\nDone."
+	if got != want {
+		t.Errorf("interleaved text/tools = %q, want %q", got, want)
+	}
+}
+
+func TestLiveTurn_ToolUseSurvivesFinalise(t *testing.T) {
+	ctx := context.Background()
+	sender := &fakeSender{}
+	lt, _ := newLT(t, sender, 0)
+
+	lt.AppendToolUse("Bash")
+	lt.Append("ran the build")
+	_ = lt.Flush(ctx) // open the live message so Finalise has an item to close
+	_, _ = lt.Finalise(ctx, "— $0.0010 · 1.0s")
+
+	last := sender.calls[len(sender.calls)-1]
+	if last.op != "finalise" {
+		t.Fatalf("last op = %q, want finalise", last.op)
+	}
+	want := "🔧 Bash\nran the build\n\n— $0.0010 · 1.0s"
+	if last.text != want {
+		t.Errorf("finalise text = %q, want %q", last.text, want)
+	}
+}
+
 func equalStrs(a, b []string) bool {
 	if len(a) != len(b) {
 		return false

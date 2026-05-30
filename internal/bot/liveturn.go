@@ -49,7 +49,16 @@ type LiveTurn struct {
 	quoted           bool   // true after the first SendLive of the turn
 	flushed          string // last translated text actually sent on the wire
 	lastFinaliseText string // composed text from the last Finalise call
+	lastTool         string // most recent tool-use indicator name (consecutive-dedup)
+	afterTool        bool   // buffer currently ends with a tool indicator (no newline yet)
 }
+
+// toolUsePrefix marks a tool-use indicator line. The wrench emoji and the tool
+// name that follows contain no characters translateMarkdown rewrites
+// (`* _ ~ # ` [ !`), so an indicator line is a translation fixpoint and
+// survives Flush/Finalise unchanged. Proven by
+// TestLiveTurn_ToolIndicatorIsMarkdownFixpoint.
+const toolUsePrefix = "🔧 "
 
 func newLiveTurn(
 	log *slog.Logger,
@@ -73,7 +82,55 @@ func newLiveTurn(
 
 // Append accumulates assistant text. Does not touch the wire.
 func (lt *LiveTurn) Append(text string) {
+	if text == "" {
+		return
+	}
+	// Text immediately following a tool-use indicator opens a fresh line so the
+	// prose doesn't glue onto the "🔧 <name>" line. Streaming deltas of ordinary
+	// text never hit this (afterTool is only set by AppendToolUse).
+	if lt.afterTool {
+		lt.ensureLineBreak()
+		lt.afterTool = false
+	}
 	lt.buf.WriteString(text)
+	// Assistant text following a tool-use indicator starts a new logical run:
+	// reset dedup so an identical tool name after text reads as a fresh action
+	// rather than being collapsed into the earlier one.
+	lt.lastTool = ""
+}
+
+// AppendToolUse records a tool-use indicator (🔧 <name>) on its own line in the
+// buffer. Gated by the caller on cfg.Claude.ShowToolUse — when the flag is off
+// runTurn never calls this and the buffer is unchanged.
+//
+// Consecutive identical tool names are deduped: claude frequently fires the
+// same tool repeatedly (e.g. several Reads in a row), and emitting one line per
+// call would spam the reply. A different tool name, or any assistant text in
+// between (which resets lastTool via Append), starts a fresh indicator. Each
+// indicator is its own line so it reads cleanly inline in SimpleX, including
+// the ordering case where tool use arrives before any assistant text — the
+// indicator is just buffer content, so the lazy-open in Flush opens the live
+// message on the next flush exactly as it would for text. No trailing newline
+// is written, so a reply that ends on a tool indicator has no dangling blank
+// line; the following Append (if any) inserts the separator.
+func (lt *LiveTurn) AppendToolUse(name string) {
+	if name == "" || name == lt.lastTool {
+		return
+	}
+	lt.lastTool = name
+	lt.ensureLineBreak()
+	lt.buf.WriteString(toolUsePrefix)
+	lt.buf.WriteString(name)
+	lt.afterTool = true
+}
+
+// ensureLineBreak writes a newline iff the buffer is non-empty and doesn't
+// already end in one, so the next segment starts on its own line.
+func (lt *LiveTurn) ensureLineBreak() {
+	cur := lt.buf.String()
+	if cur != "" && !strings.HasSuffix(cur, "\n") {
+		lt.buf.WriteByte('\n')
+	}
 }
 
 // Flush translates the cumulative buffer and pushes it as a live update.
@@ -143,6 +200,11 @@ func (lt *LiveTurn) rotate(ctx context.Context) error {
 	lt.itemID = 0
 	lt.buf.Reset()
 	lt.flushed = ""
+	// Fresh chunk starts with no carried-over tool-indicator state: the next
+	// segment must not inherit dedup or the pending-newline flag from the
+	// rotated-away buffer.
+	lt.lastTool = ""
+	lt.afterTool = false
 	return nil
 }
 
