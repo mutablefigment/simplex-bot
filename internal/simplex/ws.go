@@ -501,8 +501,14 @@ func (c *wsClient) removeReceivedFile(fileID int64, destPath string) {
 }
 
 // buildReceiveCmd renders /freceive. destPath, when set, tells simplex-chat
-// where to write the file; the path must not contain spaces (the command
-// grammar is whitespace-delimited), which the caller guarantees by sanitising.
+// where to write the file. The command grammar is whitespace-delimited, so
+// destPath must not contain whitespace or simplex-chat truncates it and
+// misplaces the attachment. This invariant is upheld by two upstream
+// guarantees: the inbox directory prefix is validated whitespace-free at config
+// load (internal/config Validate, issue #29), and the per-file suffix is built
+// from a decimal timestamp, a decimal fileId, and safeFileName (which maps every
+// byte <= ' ' to '_') in internal/bot ingestFiles. buildReceiveCmd does not
+// re-sanitise.
 func buildReceiveCmd(fileID int64, destPath string) string {
 	if destPath == "" {
 		return fmt.Sprintf("/freceive %d", fileID)
