@@ -129,7 +129,6 @@ var (
 	// Bold content allows `*` so nested italics survive (`**a *b* c**`); the
 	// italic pass running afterwards will translate the inner span.
 	boldRE   = regexp.MustCompile(`\*\*(.+?)\*\*`)
-	italicRE = regexp.MustCompile(`\*([^*\n]+?)\*`)
 	strikeRE = regexp.MustCompile(`~~([^~\n]+?)~~`)
 	linkRE   = regexp.MustCompile(`(^|[^!])\[([^\]\n]+)\]\(([^)\n]+)\)`)
 )
@@ -138,10 +137,75 @@ func applyInlineTransforms(s string) string {
 	// Go's regexp treats $1 followed by alphanumerics as a single variable
 	// name ($1B looks up the variable "1B"), so always brace the index.
 	s = boldRE.ReplaceAllString(s, boldOpen+"${1}"+boldClose)
-	s = italicRE.ReplaceAllString(s, "_${1}_")
+	s = transformItalics(s)
 	s = strikeRE.ReplaceAllString(s, "~${1}~")
 	s = linkRE.ReplaceAllString(s, "${1}${2} (${3})")
 	s = strings.ReplaceAll(s, boldOpen, "*")
 	s = strings.ReplaceAll(s, boldClose, "*")
 	return s
+}
+
+// transformItalics rewrites `*italic*` spans to `_italic_` while leaving
+// literal asterisks in prose alone (e.g. `a * b`, `*.go and *.md`,
+// `a * b * c`). Go's RE2 has no lookaround/backreferences, so a regex can't
+// express CommonMark's flanking rules; a small left-to-right scan is clearer
+// and lets us require that a span's delimiters hug non-space content.
+//
+// A `*` opens a span only when it is left-flanking (immediately followed by a
+// non-space, non-`*` char) and closes one only when right-flanking (the run
+// preceding it is non-empty and its last char is non-space). The span body may
+// not contain `*` or whitespace adjacent to either delimiter, which is what
+// distinguishes real emphasis from stray asterisks separated by spaces.
+//
+// Bold sentinels (\x00B / B\x00) have already replaced bold `**…**`, so any
+// `*` reaching here is a genuine single-asterisk candidate; this keeps nested
+// italics inside bold (`**a *b* c**`) composing correctly.
+func transformItalics(s string) string {
+	var out strings.Builder
+	out.Grow(len(s))
+	i := 0
+	for i < len(s) {
+		if s[i] != '*' {
+			out.WriteByte(s[i])
+			i++
+			continue
+		}
+		// Candidate opener: must be left-flanking — next char exists and is
+		// neither whitespace nor another '*'.
+		if i+1 >= len(s) || isSpaceByte(s[i+1]) || s[i+1] == '*' {
+			out.WriteByte(s[i])
+			i++
+			continue
+		}
+		// Scan for a right-flanking closer on the same logical run: the char
+		// just before the closing '*' must be non-space, and the body must not
+		// contain another '*'.
+		closed := -1
+		for j := i + 1; j < len(s); j++ {
+			if s[j] == '*' {
+				if !isSpaceByte(s[j-1]) {
+					closed = j
+				}
+				// First '*' encountered ends the candidate body either way:
+				// nested single asterisks aren't valid emphasis here.
+				break
+			}
+		}
+		if closed < 0 {
+			out.WriteByte(s[i])
+			i++
+			continue
+		}
+		out.WriteByte('_')
+		out.WriteString(s[i+1 : closed])
+		out.WriteByte('_')
+		i = closed + 1
+	}
+	return out.String()
+}
+
+// isSpaceByte reports whether b is an ASCII space, tab, or newline — the only
+// whitespace the line-oriented translator needs to flank against.
+func isSpaceByte(b byte) bool {
+	return b == ' ' || b == '\t' || b == '\n' || b == '\r'
 }

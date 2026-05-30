@@ -26,10 +26,22 @@ func TestTranslateMarkdown(t *testing.T) {
 		{"two italics", "*x* *y*", "_x_ _y_"},
 		{"unclosed italic", "*nope", "*nope"},
 
+		// literal asterisks in prose must NOT become italics (issue #35)
+		{"literal asterisk multiply spaced", "use a * b and c * d", "use a * b and c * d"},
+		{"literal asterisk globs", "files: *.go and *.md", "files: *.go and *.md"},
+		{"literal asterisk product chain", "the product a * b * c", "the product a * b * c"},
+		{"literal asterisk single spaced pair", "a * b", "a * b"},
+		{"literal asterisk leading glob only", "*.go files", "*.go files"},
+		{"italic still works among literals", "use a * b then *really* fast", "use a * b then _really_ fast"},
+		{"bold survives among literal asterisks", "a * b and **bold** c", "a * b and *bold* c"},
+
 		// bold + italic interactions (the load-bearing case)
 		{"bold then italic", "**a** *b*", "*a* _b_"},
 		{"italic then bold", "*a* **b**", "_a_ *b*"},
 		{"italic inside bold", "**a *b* c**", "*a _b_ c*"},
+		{"nested italic in bold regression (#35)", "**a *b* c**", "*a _b_ c*"},
+		{"bold simple regression (#35)", "**bold**", "*bold*"},
+		{"italic simple regression (#35)", "*italic*", "_italic_"},
 		{"bold not clobbered by italic pass", "**bold**", "*bold*"},
 		{"adjacent bold and italic", "**bold***italic*", "*bold*_italic_"},
 
