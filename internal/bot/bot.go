@@ -74,9 +74,17 @@ func (b *Bot) Run(ctx context.Context) error {
 		case simplex.ConnectedEvent:
 			b.log.Info("simplex: connected")
 			if !workerStarted {
-				if err := b.runStartupCleanup(ctx); err != nil {
-					b.log.Warn("startup cleanup", "err", err)
-				}
+				// Startup cleanup talks to the wire (Finalise per orphan,
+				// each up to ~15s on RPC timeout). Do it off-loop so the
+				// event-dispatch loop keeps reading from the WS channel; if
+				// the user sends a prompt before cleanup is done the worker
+				// will pick it up — orphan finalisation can race the first
+				// real turn without harm.
+				go func() {
+					if err := b.runStartupCleanup(ctx); err != nil {
+						b.log.Warn("startup cleanup", "err", err)
+					}
+				}()
 				go func() {
 					defer close(workerDone)
 					b.runWorker(ctx)
@@ -172,7 +180,13 @@ func (b *Bot) handleStop(ctx context.Context, ev simplex.ChatItemsEvent) {
 	cancel := b.activeCancel
 	b.mu.Unlock()
 	if cancel == nil {
-		_, _ = b.simplex.Send(ctx, ev.ContactID, "nothing to stop", ev.ItemID)
+		// Don't block the event loop on a WS RPC. Send takes the call
+		// timeout (~10s) + write timeout (~5s) and the event dispatcher
+		// is the only thing draining the WS read channel — backing it up
+		// stalls further inbound messages.
+		go func() {
+			_, _ = b.simplex.Send(ctx, ev.ContactID, "nothing to stop", ev.ItemID)
+		}()
 		return
 	}
 	cancel()
