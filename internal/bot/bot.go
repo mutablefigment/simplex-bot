@@ -367,9 +367,11 @@ func (b *Bot) finishTurn(ctx context.Context, turnID int64, base store.Turn, sta
 	}
 	// Detach: turn-row bookkeeping shouldn't be lost just because /stop or the
 	// turn timeout cancelled the parent ctx.
-	if err := b.store.UpdateTurn(detached(ctx), base); err != nil {
+	dctx, dcancel := detached()
+	if err := b.store.UpdateTurn(dctx, base); err != nil {
 		b.log.Error("update turn row", "err", err)
 	}
+	dcancel()
 }
 
 // errorSuffix returns a fixed, opaque suffix for the user-visible reply.

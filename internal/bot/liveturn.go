@@ -106,13 +106,15 @@ func (lt *LiveTurn) Flush(ctx context.Context) error {
 		// happened to race against /stop or timeout, the row wouldn't get
 		// written and orphan cleanup on next restart would miss the live
 		// message.
-		if err := lt.store.InsertLiveMessage(detached(ctx), store.LiveMessage{
+		dctx, dcancel := detached()
+		if err := lt.store.InsertLiveMessage(dctx, store.LiveMessage{
 			ItemID:    id,
 			ContactID: lt.contactID,
 			StartedAt: time.Now().UTC(),
 		}); err != nil {
 			lt.log.Error("insert live_message", "err", err)
 		}
+		dcancel()
 	} else {
 		if err := lt.sender.UpdateLive(ctx, lt.contactID, lt.itemID, text); err != nil {
 			return fmt.Errorf("simplex UpdateLive: %w", err)
@@ -133,9 +135,11 @@ func (lt *LiveTurn) rotate(ctx context.Context) error {
 	if err := lt.sender.Finalise(ctx, lt.contactID, lt.itemID, lt.flushed); err != nil {
 		return fmt.Errorf("simplex Finalise (rotate): %w", err)
 	}
-	if err := lt.store.FinaliseLiveMessage(detached(ctx), lt.itemID); err != nil {
+	dctx, dcancel := detached()
+	if err := lt.store.FinaliseLiveMessage(dctx, lt.itemID); err != nil {
 		lt.log.Error("mark live_message finalised", "err", err)
 	}
+	dcancel()
 	lt.itemID = 0
 	lt.buf.Reset()
 	lt.flushed = ""
@@ -166,9 +170,11 @@ func (lt *LiveTurn) Finalise(ctx context.Context, suffix string) (sent bool, err
 	if err := lt.sender.Finalise(ctx, lt.contactID, lt.itemID, text); err != nil {
 		return false, fmt.Errorf("simplex Finalise: %w", err)
 	}
-	if err := lt.store.FinaliseLiveMessage(detached(ctx), lt.itemID); err != nil {
+	dctx, dcancel := detached()
+	if err := lt.store.FinaliseLiveMessage(dctx, lt.itemID); err != nil {
 		lt.log.Error("mark live_message finalised", "err", err)
 	}
+	dcancel()
 	lt.itemID = 0
 	lt.flushed = text
 	return true, nil
@@ -182,10 +188,9 @@ func (lt *LiveTurn) FinaliseText() string {
 }
 
 // detached returns a background-derived ctx with a 5s timeout, used for local
-// sqlite bookkeeping that shouldn't be cancelled by a user /stop or turn
-// timeout. Returns parent ctx if it already has a Deadline (so tests with
-// short timeouts still bound DB calls).
-func detached(_ context.Context) context.Context {
-	ctx, _ := context.WithTimeout(context.Background(), 5*time.Second)
-	return ctx
+// sqlite bookkeeping that must outlive a user /stop or turn timeout. Callers
+// must invoke the returned cancel func once the DB call returns to release the
+// underlying timer (go vet flags discarded cancels).
+func detached() (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.Background(), 5*time.Second)
 }
