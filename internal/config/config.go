@@ -3,6 +3,8 @@ package config
 import (
 	"fmt"
 	"os"
+	"strings"
+	"unicode"
 
 	"github.com/BurntSushi/toml"
 )
@@ -85,5 +87,33 @@ func (c *Config) Validate() error {
 	if c.Storage.DBPath == "" {
 		return fmt.Errorf("storage.db_path is required")
 	}
+	// The inbox directory is interpolated into the `/freceive <fileId> <path>`
+	// command (internal/simplex/ws.go buildReceiveCmd), whose grammar is
+	// whitespace-delimited. Any whitespace in the inbox path makes simplex-chat
+	// truncate the destination and write attachments to the wrong place, so the
+	// bot can never download files (issue #29). Reject it at load time with an
+	// actionable message naming the exact offending field, rather than failing
+	// opaquely per-attachment at runtime.
+	//
+	// Validate the ACTUAL effective inbox path: storage.inbox_dir when set,
+	// otherwise claude.workspace (which becomes workspace/inbox — see
+	// internal/bot/bot.go ingestFiles). We do not reject whitespace in
+	// claude.workspace when storage.inbox_dir is set and overrides it: only the
+	// path that actually feeds /freceive is load-bearing for this bug, and a
+	// space elsewhere in the workspace tree is the operator's prerogative.
+	if c.Storage.InboxDir != "" {
+		if containsWhitespace(c.Storage.InboxDir) {
+			return fmt.Errorf("storage.inbox_dir must not contain whitespace: %q (the inbox path is passed to the whitespace-delimited /freceive command, which would truncate it and misplace attachments)", c.Storage.InboxDir)
+		}
+	} else if containsWhitespace(c.Claude.Workspace) {
+		return fmt.Errorf("claude.workspace must not contain whitespace: %q (with storage.inbox_dir unset the inbox becomes workspace/inbox, which is passed to the whitespace-delimited /freceive command and would be truncated, misplacing attachments)", c.Claude.Workspace)
+	}
 	return nil
+}
+
+// containsWhitespace reports whether s contains any whitespace rune (space, tab,
+// CR, LF, vertical tab, form feed, and other Unicode spaces). Used to reject
+// inbox paths the whitespace-delimited /freceive command cannot carry intact.
+func containsWhitespace(s string) bool {
+	return strings.IndexFunc(s, unicode.IsSpace) >= 0
 }
