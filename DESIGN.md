@@ -130,6 +130,7 @@ turn_timeout = "30m"
 db_path = "/var/lib/claude-bot/state.db"
 inbox_dir = "/var/lib/claude-bot/workspace/inbox"
 inbox_retention = "30d"
+max_attachment_size = "100MiB"   # 0 = unlimited; SI (MB=10^6) + IEC (MiB=2^20) suffixes
 
 [live_message]
 update_interval = "3s"
@@ -239,6 +240,7 @@ Bot's first live message of each turn quotes the user's prompt via `quotedItemId
 ## Media
 
 - **Inbound:** a received chat item carries attachment metadata in a sibling `file` block (`CIFile`: `fileId`/`fileName`/`fileSize`/`fileStatus`). For each offered file (status `rcvInvitation`) the bot issues `/freceive <fileId> <workspace>/inbox/<ts>_<safe-name>`, blocks until the matching `rcvFileComplete` push confirms the bytes are on disk, then suffixes the prompt with `[attached: ./inbox/<ts>_<name>]` (one line per file). Filenames are sanitised to a single component — no separators, parent refs, leading dots, or whitespace (the `/freceive` grammar is space-delimited). A file with no caption is still a valid prompt. Claude reads the file via its own tool. Background goroutine deletes inbox files older than `inbox_retention`.
+  - **Size cap (issue #33):** before issuing `/freceive`, the bot compares the sender-advertised `fileSize` against `storage.max_attachment_size` (default `100MiB`; `0` = unlimited). Oversized files are skipped before any bytes are downloaded and the user is notified (`⚠️ attachment … is too large`), so a single huge — or a flood of large — attachment can't exhaust the inbox disk between sweeps. The size is parsed from a human-readable `ByteSize` (SI `MB`=10^6 / IEC `MiB`=2^20, parallel to the `Duration` type). The check trusts the wire-reported size: the bot serves a single whitelisted contact, so this is reliability hardening rather than a defence against a malicious peer lying about size.
   - Receiving runs on the WS event-loop goroutine and blocks (per-file timeout) until the transfer completes; acceptable for a single-user loopback bot. Wire shapes follow the simplex-chat TypeScript client types but are **unverified against a live instance** — in particular whether `/freceive` honours an absolute destination path (vs. a path relative to simplex-chat's files folder). Smoke-test before relying on it.
 - **Outbound:** text-only. Claude writes files in workspace; user reads via subsequent prompt.
 

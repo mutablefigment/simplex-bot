@@ -218,9 +218,22 @@ func (b *Bot) ingestFiles(ctx context.Context, ev simplex.ChatItemsEvent) []stri
 	}
 
 	ts := time.Now().Unix()
+	maxSize := int64(b.cfg.Storage.MaxAttachmentSize)
 	var refs []string
 	for _, f := range ev.Files {
 		safe := safeFileName(f.Name)
+		// Size gate (issue #33): refuse oversized attachments before starting
+		// the download so a large/many transfer can't exhaust the inbox disk.
+		// f.Size is the sender-advertised size from the wire; we trust it for a
+		// single whitelisted contact. A cap of 0 means unlimited.
+		if maxSize > 0 && f.Size > maxSize {
+			b.log.Warn("attachment exceeds size cap; skipped",
+				"name", safe, "file_id", f.ID, "bytes", f.Size, "max_bytes", maxSize)
+			_, _ = b.simplex.Send(ctx, ev.ContactID,
+				fmt.Sprintf("⚠️ attachment %q is too large (%d bytes, max %d) — skipped",
+					safe, f.Size, maxSize), ev.ItemID)
+			continue
+		}
 		// Per-file uniqueness: f.ID is simplex's per-transfer fileId — distinct
 		// for every attachment, including two in the same message that sanitise
 		// to the same name (e.g. both "file"). Embedding it guarantees no
