@@ -4,6 +4,7 @@ import (
 	"context"
 	"io"
 	"log/slog"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -72,6 +73,111 @@ func TestHandleChatItem_FileOnly(t *testing.T) {
 	j := dequeue(t, b)
 	if !strings.HasPrefix(j.prompt, "[attached: ./inbox/") || !strings.HasSuffix(j.prompt, "_doc.pdf]") {
 		t.Errorf("file-only prompt = %q, want a bare ./inbox attachment reference", j.prompt)
+	}
+}
+
+// TestIngestFiles_SameNameDistinctPaths covers issue #30: two attachments in
+// one message whose names are identical must land at distinct dest paths (no
+// overwrite) and both must be referenced in the resulting prompt.
+func TestIngestFiles_SameNameDistinctPaths(t *testing.T) {
+	fake := newFakeSimplex()
+	b := newAttachmentBot(t, fake)
+
+	b.handleChatItem(context.Background(), simplex.ChatItemsEvent{
+		ContactID: 42,
+		ItemID:    11,
+		Text:      "two of the same",
+		Files: []simplex.File{
+			{ID: 100, Name: "report.pdf", Size: 1},
+			{ID: 101, Name: "report.pdf", Size: 2},
+		},
+	})
+
+	j := dequeue(t, b)
+
+	// Both attachments referenced in the prompt.
+	if n := strings.Count(j.prompt, "[attached: ./inbox/"); n != 2 {
+		t.Fatalf("prompt = %q, want 2 attachment references, got %d", j.prompt, n)
+	}
+
+	// The two dest paths handed to ReceiveFile must differ.
+	dests := receiveDests(fake)
+	if len(dests) != 2 {
+		t.Fatalf("ReceiveFile called %d times, want 2; dests = %v", len(dests), dests)
+	}
+	if dests[0] == dests[1] {
+		t.Errorf("same-name attachments collided on dest %q", dests[0])
+	}
+	for _, d := range dests {
+		assertNoWhitespace(t, d)
+		// fileId is embedded so each path is unambiguous.
+		if !strings.HasSuffix(d, "_report.pdf") {
+			t.Errorf("dest %q lost its sanitised name suffix", d)
+		}
+	}
+	if !strings.Contains(dests[0], "_100_") || !strings.Contains(dests[1], "_101_") {
+		t.Errorf("dests %v do not each embed their fileId", dests)
+	}
+}
+
+// TestIngestFiles_BothSanitiseToFile covers the sneakier collision: two names
+// that are different on the wire but both reduce to "file" via safeFileName
+// (e.g. all-dots / all-control-chars). They must still get distinct paths.
+func TestIngestFiles_BothSanitiseToFile(t *testing.T) {
+	fake := newFakeSimplex()
+	b := newAttachmentBot(t, fake)
+
+	b.handleChatItem(context.Background(), simplex.ChatItemsEvent{
+		ContactID: 42,
+		ItemID:    12,
+		Text:      "",
+		Files: []simplex.File{
+			{ID: 7, Name: "...", Size: 1}, // all dots -> "" after trim -> "file"
+			{ID: 8, Name: "", Size: 2},    // empty name -> "file"
+		},
+	})
+
+	j := dequeue(t, b)
+	if n := strings.Count(j.prompt, "[attached: ./inbox/"); n != 2 {
+		t.Fatalf("prompt = %q, want 2 attachment references, got %d", j.prompt, n)
+	}
+
+	dests := receiveDests(fake)
+	if len(dests) != 2 {
+		t.Fatalf("ReceiveFile called %d times, want 2; dests = %v", len(dests), dests)
+	}
+	if dests[0] == dests[1] {
+		t.Errorf("both-sanitise-to-file attachments collided on dest %q", dests[0])
+	}
+	for _, d := range dests {
+		assertNoWhitespace(t, d)
+		if !strings.HasSuffix(d, "_file") {
+			t.Errorf("dest %q did not fall back to the _file suffix", d)
+		}
+	}
+}
+
+// receiveDests returns, in order, the destPath argument of every ReceiveFile
+// call recorded by the fake. The fake stores destPath in sentMsg.text.
+func receiveDests(f *fakeSimplex) []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	var dests []string
+	for _, s := range f.sends {
+		if s.op == "receive_file" {
+			dests = append(dests, s.text)
+		}
+	}
+	return dests
+}
+
+func assertNoWhitespace(t *testing.T, path string) {
+	t.Helper()
+	// The base name (the component we generate) must carry no whitespace, so
+	// the whole reference survives the space-delimited /freceive grammar.
+	base := filepath.Base(path)
+	if strings.ContainsAny(base, " \t\n\r\v\f") {
+		t.Errorf("generated name %q contains whitespace (breaks /freceive grammar)", base)
 	}
 }
 

@@ -221,7 +221,14 @@ func (b *Bot) ingestFiles(ctx context.Context, ev simplex.ChatItemsEvent) []stri
 	var refs []string
 	for _, f := range ev.Files {
 		safe := safeFileName(f.Name)
-		dest := filepath.Join(inbox, fmt.Sprintf("%d_%s", ts, safe))
+		// Per-file uniqueness: f.ID is simplex's per-transfer fileId — distinct
+		// for every attachment, including two in the same message that sanitise
+		// to the same name (e.g. both "file"). Embedding it guarantees no
+		// collision/overwrite (issue #30). The leading ts is retained only as a
+		// human-readable age hint; retention is mtime-based (see sweepInbox), so
+		// it carries no correctness weight. fileId renders as decimal digits —
+		// no whitespace — so the dest stays valid for the /freceive grammar.
+		dest := filepath.Join(inbox, fmt.Sprintf("%d_%d_%s", ts, f.ID, safe))
 
 		rctx, cancel := context.WithTimeout(ctx, fileReceiveTimeout)
 		path, err := b.simplex.ReceiveFile(rctx, f.ID, dest)
