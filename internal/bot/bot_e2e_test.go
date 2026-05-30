@@ -255,6 +255,108 @@ func truncate(s string, n int) string {
 	return s[:n] + "…"
 }
 
+// TestBot_DispatchNonBlockingDownload is the regression guard for issue #28:
+// an inbound attachment whose download blocks (here, indefinitely until we
+// release a gate) must NOT stall the event-dispatch loop. We inject a
+// file-carrying message, wait for the worker to actually enter ReceiveFile,
+// then inject a /stop and assert the dispatcher answers it ("nothing to stop")
+// promptly — proving the loop kept processing events while the download was
+// pending. Finally we release the gate and assert a clean (panic-free)
+// shutdown. Run under -race to catch the queue-close vs. enqueue race.
+func TestBot_DispatchNonBlockingDownload(t *testing.T) {
+	const allowedCID = int64(42)
+	tmp := t.TempDir()
+
+	cfg := &config.Config{
+		Simplex: config.Simplex{AllowedContactID: allowedCID},
+		Claude: config.Claude{
+			Workspace:   tmp,
+			TurnTimeout: config.Duration(10 * time.Second),
+		},
+		LiveMessage: config.LiveMessage{
+			UpdateInterval: config.Duration(5 * time.Millisecond),
+			ChunkThreshold: 4096,
+		},
+	}
+
+	st, err := store.Open(context.Background(), filepath.Join(tmp, "state.db"))
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer st.Close()
+
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	fake := newFakeSimplex()
+	// Gate the download so it blocks inside ReceiveFile until we choose to let
+	// it proceed; receiveStarted tells us the worker has entered the transfer.
+	fake.receiveGate = make(chan struct{})
+	fake.receiveStarted = make(chan struct{}, 1)
+
+	runner := &fakeRunner{script: []claude.Event{
+		claude.InitEvent{SessionID: "s1"},
+		claude.AssistantTextEvent{Text: "got the file"},
+		claude.ResultEvent{},
+	}}
+	b := New(cfg, log, "test", fake, runner, st)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	runDone := make(chan error, 1)
+	go func() { runDone <- b.Run(ctx) }()
+
+	// 1) File-carrying message → dispatcher classifies + enqueues; worker picks
+	// it up and blocks in the gated ReceiveFile.
+	fake.inject(simplex.ChatItemsEvent{
+		ContactID: allowedCID,
+		ItemID:    300,
+		Text:      "look at this",
+		Files:     []simplex.File{{ID: 9, Name: "slow.bin", Size: 10}},
+	})
+
+	// Wait until the download has actually begun before probing the loop.
+	select {
+	case <-fake.receiveStarted:
+	case <-time.After(5 * time.Second):
+		t.Fatal("worker never entered ReceiveFile")
+	}
+
+	// 2) With the download still pending (gate held), inject /stop. If the
+	// dispatch loop were blocked on the download this would never be answered.
+	// /stop is classified + answered synchronously on the dispatcher, so the
+	// reply landing promptly proves the loop is still processing events.
+	fake.inject(simplex.ChatItemsEvent{
+		ContactID: allowedCID,
+		ItemID:    301,
+		Text:      "/stop",
+	})
+	stopAck := fake.waitOp(t, "send", 3*time.Second)
+	if !strings.Contains(strings.ToLower(stopAck.text), "nothing to stop") {
+		t.Errorf("/stop during pending download: got %q, want 'nothing to stop'", stopAck.text)
+	}
+
+	// 3) Release the download. The worker finishes ingest, builds the prompt
+	// (caption + attachment ref) and runs the scripted turn to a finalise.
+	close(fake.receiveGate)
+	final := fake.waitOp(t, "finalise", 5*time.Second)
+	if !strings.Contains(final.text, "got the file") {
+		t.Errorf("turn finalise = %q, want the scripted 'got the file' reply", final.text)
+	}
+
+	// 4) Clean shutdown: cancel ctx, Run drains the worker and closes the queue
+	// without panicking. The close(b.queue)/<-workerDone handshake (run under
+	// -race) must not race with an in-flight enqueue.
+	cancel()
+	select {
+	case err := <-runDone:
+		if err != nil && !errors.Is(err, context.Canceled) {
+			t.Errorf("Run returned unexpected err: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Run did not return after ctx cancel (shutdown stalled)")
+	}
+}
+
 // fakeSimplex is an in-memory simplex.Client. inject() pushes events to the
 // bot; sends are recorded for assertion.
 type fakeSimplex struct {
@@ -263,6 +365,14 @@ type fakeSimplex struct {
 	sends  []sentMsg
 	sendCh chan sentMsg
 	closed bool
+
+	// receiveGate, when non-nil, blocks every ReceiveFile call until the gate is
+	// closed (or the call's ctx is cancelled). Used to simulate a slow inbound
+	// download and prove the dispatch loop doesn't stall on it (issue #28).
+	// receiveStarted is signalled once per ReceiveFile entry so a test can wait
+	// for the download to actually begin before asserting the loop stays live.
+	receiveGate    chan struct{}
+	receiveStarted chan struct{}
 }
 
 type sentMsg struct {
@@ -324,6 +434,22 @@ func (f *fakeSimplex) Finalise(ctx context.Context, cid, iid int64, text string)
 	return err
 }
 func (f *fakeSimplex) ReceiveFile(ctx context.Context, fileID int64, destPath string) (string, error) {
+	f.mu.Lock()
+	gate, started := f.receiveGate, f.receiveStarted
+	f.mu.Unlock()
+	if started != nil {
+		select {
+		case started <- struct{}{}:
+		default:
+		}
+	}
+	if gate != nil {
+		select {
+		case <-gate:
+		case <-ctx.Done():
+			return "", ctx.Err()
+		}
+	}
 	_, err := f.record(sentMsg{text: destPath, op: "receive_file"})
 	return destPath, err
 }

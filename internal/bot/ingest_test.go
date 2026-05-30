@@ -25,6 +25,16 @@ func dequeue(t *testing.T, b *Bot) job {
 	}
 }
 
+// ingestJob runs the worker's prompt-building step for a dequeued attachment
+// job: download the carried files and fold their refs into the caption. This
+// mirrors runWorker exactly (issue #28 moved this work off the dispatch loop
+// onto the worker), letting the ingest tests assert on the final prompt and the
+// recorded ReceiveFile calls without spinning up a real worker.
+func ingestJob(b *Bot, j job) string {
+	refs := b.ingestFiles(context.Background(), j.contactID, j.itemID, j.files)
+	return withAttachments(j.caption, refs)
+}
+
 func newAttachmentBot(t *testing.T, fake *fakeSimplex) *Bot {
 	t.Helper()
 	cfg := &config.Config{
@@ -50,10 +60,17 @@ func TestHandleChatItem_CaptionedAttachment(t *testing.T) {
 	if j.slash != nil {
 		t.Fatalf("captioned file was parsed as a slash command")
 	}
-	if !strings.HasPrefix(j.prompt, "look\n[attached: ./inbox/") || !strings.HasSuffix(j.prompt, "_pic.png]") {
-		t.Errorf("prompt = %q, want caption + ./inbox/<ts>_pic.png attachment", j.prompt)
+	// The dispatcher only classifies + enqueues; the worker downloads. No
+	// ReceiveFile should have fired yet (issue #28: downloads are off-loop).
+	if ops := fake.snapshotOps(); len(ops) != 0 {
+		t.Errorf("dispatcher performed I/O before the worker ran; ops = %v", ops)
 	}
-	// The file was actually received into the inbox.
+
+	prompt := ingestJob(b, j)
+	if !strings.HasPrefix(prompt, "look\n[attached: ./inbox/") || !strings.HasSuffix(prompt, "_pic.png]") {
+		t.Errorf("prompt = %q, want caption + ./inbox/<ts>_pic.png attachment", prompt)
+	}
+	// The file was actually received into the inbox by the worker step.
 	if ops := fake.snapshotOps(); len(ops) == 0 || ops[0] != "receive_file" {
 		t.Errorf("ReceiveFile not called; ops = %v", ops)
 	}
@@ -71,8 +88,9 @@ func TestHandleChatItem_FileOnly(t *testing.T) {
 	})
 
 	j := dequeue(t, b)
-	if !strings.HasPrefix(j.prompt, "[attached: ./inbox/") || !strings.HasSuffix(j.prompt, "_doc.pdf]") {
-		t.Errorf("file-only prompt = %q, want a bare ./inbox attachment reference", j.prompt)
+	prompt := ingestJob(b, j)
+	if !strings.HasPrefix(prompt, "[attached: ./inbox/") || !strings.HasSuffix(prompt, "_doc.pdf]") {
+		t.Errorf("file-only prompt = %q, want a bare ./inbox attachment reference", prompt)
 	}
 }
 
@@ -94,10 +112,11 @@ func TestIngestFiles_SameNameDistinctPaths(t *testing.T) {
 	})
 
 	j := dequeue(t, b)
+	prompt := ingestJob(b, j)
 
 	// Both attachments referenced in the prompt.
-	if n := strings.Count(j.prompt, "[attached: ./inbox/"); n != 2 {
-		t.Fatalf("prompt = %q, want 2 attachment references, got %d", j.prompt, n)
+	if n := strings.Count(prompt, "[attached: ./inbox/"); n != 2 {
+		t.Fatalf("prompt = %q, want 2 attachment references, got %d", prompt, n)
 	}
 
 	// The two dest paths handed to ReceiveFile must differ.
@@ -138,8 +157,9 @@ func TestIngestFiles_BothSanitiseToFile(t *testing.T) {
 	})
 
 	j := dequeue(t, b)
-	if n := strings.Count(j.prompt, "[attached: ./inbox/"); n != 2 {
-		t.Fatalf("prompt = %q, want 2 attachment references, got %d", j.prompt, n)
+	prompt := ingestJob(b, j)
+	if n := strings.Count(prompt, "[attached: ./inbox/"); n != 2 {
+		t.Fatalf("prompt = %q, want 2 attachment references, got %d", prompt, n)
 	}
 
 	dests := receiveDests(fake)
@@ -177,16 +197,17 @@ func TestIngestFiles_OversizedSkipped(t *testing.T) {
 	})
 
 	j := dequeue(t, b)
+	prompt := ingestJob(b, j)
 
 	// Only the under-cap file is referenced in the prompt.
-	if n := strings.Count(j.prompt, "[attached: ./inbox/"); n != 1 {
-		t.Fatalf("prompt = %q, want exactly 1 attachment reference", j.prompt)
+	if n := strings.Count(prompt, "[attached: ./inbox/"); n != 1 {
+		t.Fatalf("prompt = %q, want exactly 1 attachment reference", prompt)
 	}
-	if !strings.HasSuffix(j.prompt, "_small.txt]") {
-		t.Errorf("prompt = %q, want the under-cap small.txt referenced", j.prompt)
+	if !strings.HasSuffix(prompt, "_small.txt]") {
+		t.Errorf("prompt = %q, want the under-cap small.txt referenced", prompt)
 	}
-	if strings.Contains(j.prompt, "huge.bin") {
-		t.Errorf("prompt = %q, oversized huge.bin must not be referenced", j.prompt)
+	if strings.Contains(prompt, "huge.bin") {
+		t.Errorf("prompt = %q, oversized huge.bin must not be referenced", prompt)
 	}
 
 	// ReceiveFile was called exactly once, for the under-cap file only.
@@ -230,8 +251,9 @@ func TestIngestFiles_UnlimitedWhenZero(t *testing.T) {
 	})
 
 	j := dequeue(t, b)
-	if n := strings.Count(j.prompt, "[attached: ./inbox/"); n != 1 {
-		t.Fatalf("prompt = %q, want the large attachment received under a 0 (unlimited) cap", j.prompt)
+	prompt := ingestJob(b, j)
+	if n := strings.Count(prompt, "[attached: ./inbox/"); n != 1 {
+		t.Fatalf("prompt = %q, want the large attachment received under a 0 (unlimited) cap", prompt)
 	}
 	if dests := receiveDests(fake); len(dests) != 1 {
 		t.Fatalf("ReceiveFile called %d times, want 1; dests = %v", len(dests), dests)
