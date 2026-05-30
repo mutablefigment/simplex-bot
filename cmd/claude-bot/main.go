@@ -29,8 +29,16 @@ func main() {
 	log := logging.New(cfg.Log)
 	log.Info("starting", "version", version, "config", *cfgPath)
 
-	must(os.MkdirAll(cfg.Claude.Workspace, 0o755))
-	must(os.MkdirAll(cfg.Storage.InboxDir, 0o755))
+	// 0o700 — defense-in-depth. The systemd unit already restricts via
+	// User=claude-bot + ProtectHome=tmpfs, but the bot shouldn't rely on that
+	// alone: the workspace can hold files Claude writes via the Write/Edit
+	// tools, and the inbox holds user-sent attachments. Both can be sensitive.
+	// Chmod after MkdirAll to repair perms on dirs created by a previous
+	// version that used 0o755.
+	must(os.MkdirAll(cfg.Claude.Workspace, 0o700))
+	must(os.Chmod(cfg.Claude.Workspace, 0o700))
+	must(os.MkdirAll(cfg.Storage.InboxDir, 0o700))
+	must(os.Chmod(cfg.Storage.InboxDir, 0o700))
 
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
