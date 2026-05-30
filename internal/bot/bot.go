@@ -114,8 +114,9 @@ func (b *Bot) Run(ctx context.Context) error {
 //
 // Wire-side Finalise failures are non-fatal — we mark the DB row finalised
 // anyway to avoid an unbounded loop on phantom items (e.g. the user deleted
-// the chat). Original partial text is discarded; surfacing it would require
-// implementing simplex.GetChats, which is deferred.
+// the chat). Original partial text is discarded: the live_messages mirror is
+// the authoritative record of what we authored, so there's nothing to recover
+// from the wire side.
 func (b *Bot) runStartupCleanup(ctx context.Context) error {
 	orphans, err := b.store.UnfinalisedLiveMessages(ctx)
 	if err != nil {

@@ -23,14 +23,3 @@ type File struct {
 	Path string
 	Size int64
 }
-
-type Chat struct {
-	ContactID int64
-	Items     []ChatItem
-}
-
-type ChatItem struct {
-	ItemID   int64
-	ItemLive bool
-	Mine     bool
-}

@@ -323,8 +323,7 @@ func (f *fakeSimplex) Finalise(ctx context.Context, cid, iid int64, text string)
 	_, err := f.record(sentMsg{contactID: cid, text: text, op: "finalise"})
 	return err
 }
-func (f *fakeSimplex) GetChats(ctx context.Context) ([]simplex.Chat, error) { return nil, nil }
-func (f *fakeSimplex) Close() error                                          { return nil }
+func (f *fakeSimplex) Close() error { return nil }
 
 func (f *fakeSimplex) sendCount() int {
 	f.mu.Lock()
