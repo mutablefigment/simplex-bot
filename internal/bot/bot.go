@@ -38,10 +38,24 @@ type Bot struct {
 	activeCancel context.CancelFunc // set while a turn is running; /stop calls it
 }
 
-// job is a unit of work for the worker. Exactly one of prompt or slash is set.
+// job is a unit of work for the worker. Exactly one of slash or a prompt-turn
+// is set; for a prompt-turn the caption + raw files travel together so the
+// worker (not the dispatcher) performs the blocking attachment download.
 // /stop is NOT routed through here — it short-circuits in handleChatItem and
 // cancels the active turn directly via activeCancel.
+//
+// Attachment downloads run on the worker rather than the dispatcher (issue #28):
+// the dispatcher only classifies + enqueues (so /stop, /new and new messages
+// stay responsive while a transfer is in flight), and the worker builds the
+// final prompt from caption + freshly-ingested file refs when it dequeues.
+// Carrying the files on the job (vs. spawning a per-message ingest goroutine)
+// preserves message ordering, serialises downloads, keeps the queue-full drop
+// before any download, and avoids a queue-close race on shutdown.
 type job struct {
+	// caption is the raw message text (without attachment refs). prompt is the
+	// final text built by the worker from caption + ingested file refs.
+	caption    string
+	files      []simplex.File
 	prompt     string
 	slash      *Cmd
 	itemID     int64
@@ -173,17 +187,16 @@ func (b *Bot) handleChatItem(ctx context.Context, ev simplex.ChatItemsEvent) {
 	if cmd, ok := parseCommand(text); ok && len(ev.Files) == 0 {
 		j.slash = &cmd
 	} else {
-		// Pull any attachments into the inbox and reference them in the prompt.
+		// Carry the caption + raw attachments; the worker downloads them when it
+		// dequeues so the dispatch loop never blocks on a transfer (issue #28).
 		// A file-only message (no caption) is still a valid prompt.
-		refs := b.ingestFiles(ctx, ev)
-		j.prompt = withAttachments(text, refs)
-		if j.prompt == "" {
-			// No caption and every attachment failed to download — nothing to
-			// ask Claude. ingestFiles has already told the user what broke.
-			return
-		}
+		j.caption = text
+		j.files = ev.Files
 	}
 
+	// Queue-full drop stays here — BEFORE any download — so an overloaded bot
+	// rejects immediately instead of stalling the loop on a transfer for a job
+	// it would only drop afterwards.
 	select {
 	case b.queue <- j:
 		if j.slash != nil {
@@ -197,14 +210,15 @@ func (b *Bot) handleChatItem(ctx context.Context, ev simplex.ChatItemsEvent) {
 	}
 }
 
-// ingestFiles downloads each attachment on ev into the inbox and returns the
+// ingestFiles downloads each attachment into the inbox and returns the
 // workspace-relative paths to reference in the prompt. Failures are reported to
 // the user and skipped rather than aborting the whole message. It runs on the
-// event-loop goroutine and blocks while each transfer completes; for a
-// single-user bot over loopback that's acceptable, and the per-file timeout
-// bounds the stall.
-func (b *Bot) ingestFiles(ctx context.Context, ev simplex.ChatItemsEvent) []string {
-	if len(ev.Files) == 0 {
+// WORKER goroutine (not the event-dispatch loop) and blocks while each transfer
+// completes; serialising downloads on the worker keeps the dispatch loop free
+// to process /stop and new messages (issue #28), and the per-file timeout
+// bounds each stall.
+func (b *Bot) ingestFiles(ctx context.Context, contactID, itemID int64, files []simplex.File) []string {
+	if len(files) == 0 {
 		return nil
 	}
 	inbox := b.cfg.Storage.InboxDir
@@ -213,14 +227,14 @@ func (b *Bot) ingestFiles(ctx context.Context, ev simplex.ChatItemsEvent) []stri
 	}
 	if err := os.MkdirAll(inbox, 0o700); err != nil {
 		b.log.Error("inbox mkdir", "dir", inbox, "err", err)
-		_, _ = b.simplex.Send(ctx, ev.ContactID, "⚠️ couldn't prepare inbox for attachments", ev.ItemID)
+		_, _ = b.simplex.Send(ctx, contactID, "⚠️ couldn't prepare inbox for attachments", itemID)
 		return nil
 	}
 
 	ts := time.Now().Unix()
 	maxSize := int64(b.cfg.Storage.MaxAttachmentSize)
 	var refs []string
-	for _, f := range ev.Files {
+	for _, f := range files {
 		safe := safeFileName(f.Name)
 		// Size gate (issue #33): refuse oversized attachments before starting
 		// the download so a large/many transfer can't exhaust the inbox disk.
@@ -229,9 +243,9 @@ func (b *Bot) ingestFiles(ctx context.Context, ev simplex.ChatItemsEvent) []stri
 		if maxSize > 0 && f.Size > maxSize {
 			b.log.Warn("attachment exceeds size cap; skipped",
 				"name", safe, "file_id", f.ID, "bytes", f.Size, "max_bytes", maxSize)
-			_, _ = b.simplex.Send(ctx, ev.ContactID,
+			_, _ = b.simplex.Send(ctx, contactID,
 				fmt.Sprintf("⚠️ attachment %q is too large (%d bytes, max %d) — skipped",
-					safe, f.Size, maxSize), ev.ItemID)
+					safe, f.Size, maxSize), itemID)
 			continue
 		}
 		// Per-file uniqueness: f.ID is simplex's per-transfer fileId — distinct
@@ -248,8 +262,8 @@ func (b *Bot) ingestFiles(ctx context.Context, ev simplex.ChatItemsEvent) []stri
 		cancel()
 		if err != nil {
 			b.log.Error("receive attachment", "name", safe, "file_id", f.ID, "err", err)
-			_, _ = b.simplex.Send(ctx, ev.ContactID,
-				fmt.Sprintf("⚠️ couldn't receive attachment %q: %v", safe, err), ev.ItemID)
+			_, _ = b.simplex.Send(ctx, contactID,
+				fmt.Sprintf("⚠️ couldn't receive attachment %q: %v", safe, err), itemID)
 			continue
 		}
 		refs = append(refs, b.promptPath(path))
@@ -422,6 +436,16 @@ func (b *Bot) runWorker(ctx context.Context) {
 			}
 			if j.slash != nil {
 				b.runSlash(ctx, j)
+				continue
+			}
+			// Download attachments on the worker (issue #28). This blocks up to
+			// fileReceiveTimeout per file, but the dispatch loop keeps running so
+			// /stop and new messages stay responsive while a transfer is pending.
+			refs := b.ingestFiles(ctx, j.contactID, j.itemID, j.files)
+			j.prompt = withAttachments(j.caption, refs)
+			if j.prompt == "" {
+				// No caption and every attachment failed to download — nothing to
+				// ask Claude. ingestFiles has already told the user what broke.
 				continue
 			}
 			b.runTurn(ctx, j)
